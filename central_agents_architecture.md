@@ -48,7 +48,10 @@ The Hub runs seven specialized agents, each managing a specific domain of operat
 ### 2.2 RCAAgent (The Investigator)
 * **Function**: Runs a strict **OODA** (Observe-Orient-Decide-Act) troubleshooting loop.
 * **Process**: 
-  - **Observe Phase**: Performs a comprehensive log range search using the **Splunk REST API**. While the spoke operator only tails 50 local pod logs to avoid etcd bloat, the RCAAgent runs a wide-window query over the target cluster's logs (`[triggerTime - 15m, triggerTime + 1h]`), gathering up to 500 lines of system logs, hypervisor node events, CNI status codes, and related disk metrics in parallel.
+  - **Observe Phase**: 
+    1. Reads the **`status.diagnostics`** block directly from the incoming `SREIncident` CR (containing auto-collected Pod logs, K8s Events, and Prometheus metrics snapshotted at trigger time).
+    2. Inspects `status.diagnostics.releaseContext` to check if the failure is correlated with a recent manual GitOps sync (`SRERelease`).
+    3. Runs an extended log range query via the **Splunk REST API** (`[triggerTime - 15m, triggerTime + 1h]`) to fetch hypervisor-level details, Multus CNI statuses, or Portworx OSD logs.
   - **Orient Phase**: Pulls topology graphs (Neo4j), queries runbooks and historical case studies (PostgreSQL), formulates a root-cause hypothesis, and passes the output to the planner.
 
 ### 2.3 RemediationPlannerAgent (The Architect)
@@ -178,3 +181,51 @@ To make correct decisions, the agent prompt is built dynamically using retrieved
 
 This structure allows the agent to reason securely:
 > *"The VM has disk I/O errors. Topology shows worker-02 has a degraded Portworx storage pool. The runbook instructs to migrate the VM to worker-03. I will issue a LiveMigrateVM command targeting worker-03."*
+
+---
+
+## 8. LLM Gateway: Dynamic Token Authentication
+
+For air-gapped security compliance, the central agents connect to the local models via an **Internal LLM Gateway**. Rather than utilizing static API keys, the gateway enforces a short-lived token rotation schema:
+
+### 8.1 Authentication Protocol
+1. **Dynamic Token Ingestion**: The agent is configured with gateway client credentials (`LLM_CLIENT_ID` and `LLM_CLIENT_SECRET`) mounted via Kubernetes secrets.
+2. **Token Fetching**: Before sending any completion request, the Python agent queries the internal authentication endpoint `/auth/token`.
+3. **30-Second Lifetime**: The returned Bearer token has a strict **30-second expiry**.
+4. **Auto-Refreshing Middleware**: The HTTP client implements a dynamic wrapper to handle caching and refresh requests.
+
+### 8.2 Client Implementation Pattern (Python)
+```python
+import time
+import requests
+from datetime import datetime, timedelta
+
+class GatewayTokenRefresher:
+    def __init__(self, token_url, client_id, client_secret):
+        self.token_url = token_url
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.cached_token = None
+        self.expiry_time = datetime.min
+
+    def get_token(self) -> str:
+        # Refresh if token is close to expiring (within 5 seconds of the 30-second window)
+        if not self.cached_token or datetime.utcnow() >= self.expiry_time - timedelta(seconds=5):
+            self._refresh_token()
+        return self.cached_token
+
+    def _refresh_token(self):
+        response = requests.post(
+            self.token_url,
+            auth=(self.client_id, self.client_secret),
+            data={"grant_type": "client_credentials"},
+            timeout=5
+        )
+        response.raise_for_status()
+        data = response.json()
+        self.cached_token = data["access_token"]
+        # Set expiry (30 seconds from now)
+        expires_in = int(data.get("expires_in", 30))
+        self.expiry_time = datetime.utcnow() + timedelta(seconds=expires_in)
+```
+This refresher is registered as a custom authentication middleware in the agent's LangGraph model client context.

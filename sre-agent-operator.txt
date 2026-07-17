@@ -918,31 +918,52 @@ func Reconcile(ctx, req):
   ── PHASE: "" (new, unset) ──
      Set phase = Detecting
      Set status.detectedAt = now()
-     
-     // DIAGNOSTIC STATE HARVESTING:
-     triggerTime = incident.creationTimestamp
-     for each resource in spec.affectedResources:
-       if resource.kind == "Pod" or resource.kind == "VirtualMachine":
-         // Fetch last 50 lines of stdout/stderr from the window [triggerTime - 10m, now()]
-         targetPod = getTargetPodForResource(resource)
-         status.recentLogs[targetPod.name] = client.PodLogs(targetPod.name, tailLines=50, filter="WARN|ERROR|FATAL|panic|Panic", since=triggerTime - 10m, until=now())
-         status.observedPodState[targetPod.name] = getPodStatusAndConditions(targetPod.name)
-       
-       // Gather active K8s Events related to this resource in the window [triggerTime - 10m, now()]
-       status.observedEvents = append(status.observedEvents, getK8sEventsForResource(resource, since=triggerTime - 10m, until=now()))
-     
-     Append AuditEntry: "Incident detected, live log tails and cluster events harvested"
-     emit to Kafka sre.incidents.lifecycle: phase-changed Detecting
      return RequeueAfter(2min)
 
   ── PHASE: Detecting ──
      if now() - status.detectedAt < correlationWindow (2min):
        return RequeueAfter(30s)
      
-     // Transition to Active if correlation complete
+     // ── DIAGNOSTIC AUTO-COLLECTION ON TRANSITION TO ACTIVE ──
+     triggerTime = incident.creationTimestamp
+     bundle = DiagnosticBundle{collectedAt: now()}
+
+     // 1. Harvest Pod logs and observed pod status states
+     for each resource in spec.affectedResources:
+       if resource.kind == "Pod" or resource.kind == "VirtualMachine":
+         targetPod = getTargetPodForResource(resource)
+         bundle.logExcerpts[targetPod.name] = client.PodLogs(targetPod.name, tailLines=100, filter="WARN|ERROR|FATAL|panic|Panic|Failed", since=triggerTime - 10m, until=now())
+         bundle.resourceStates[targetPod.name] = getPodStatusAndConditions(targetPod.name)
+       
+       // 2. Harvest active Kubernetes Events
+       bundle.relevantEvents = append(bundle.relevantEvents, getK8sEventsForResource(resource, since=triggerTime - 10m, until=now()))
+
+     // 3. Harvest metrics snapshot (Prometheus instant query at trigger time)
+     bundle.metricsSnapshot = promClient.QuerySnapshot(["kubevirt_vmi_phase_count", "node_memory_MemAvailable_bytes"], at=triggerTime)
+
+     // 4. Release context check: check if incident matches post-release window of an SRERelease CR
+     recentRelease = listSREReleases(
+       syncCompletedAfter = triggerTime - 30m,
+       syncCompletedBefore = triggerTime
+     )
+     if len(recentRelease) > 0:
+       bundle.releaseContext = ReleaseContext{
+         releaseRef:          recentRelease[0].name,
+         releaseName:         recentRelease[0].spec.releaseName,
+         minutesSinceDeploy:  int((triggerTime - recentRelease[0].spec.syncCompletedAt).Minutes()),
+         setEnvPluginConfigs: recentRelease[0].spec.setEnvPluginConfigs,
+       }
+       // Label incident as release-correlated
+       addLabel(incident, "sre.kubevirt.io/release-correlated", "true")
+       addLabel(incident, "sre.kubevirt.io/release-ref", recentRelease[0].name)
+
+     bundle.collectionStatus = "Complete"
+     status.diagnostics = bundle
+
+     // Transition to Active
      Set status.phase = Active
      status.activeAt = now()
-     emit to Kafka sre.incidents.lifecycle: phase-changed Active
+     emit to Kafka sre.incidents.lifecycle: phase-changed Active (including diagnostics bundle)
      return RequeueAfter(15s)
 
   ── PHASE: Active / Remediating ──
@@ -958,6 +979,58 @@ func Reconcile(ctx, req):
      if now() - status.resolvedAt > retention.maxAgeDays:
        delete(incident)
      return RequeueAfter(24h)
+```
+
+---
+
+### SREReleaseReconciler
+
+```
+TRIGGER: ArgoCD Application sync status changes (Synced + Finished)
+
+func Reconcile(ctx, req):
+
+  1. Fetch ArgoCD Application
+     if app.status.sync.status != "Synced": return RequeueAfter(30s)
+     if app.status.operationState.phase not in [Succeeded, Failed]: return RequeueAfter(15s)
+
+  2. Check if SRERelease already created for this commit revision:
+     existing = listSREReleases(commitSHA = app.status.operationState.syncResult.revision)
+     if len(existing) > 0: return no-requeue
+
+  3. Create SRERelease:
+     release = SRERelease{
+       name:        "release-" + app.status.operationState.syncResult.revision[:8],
+       spec.releaseName:       app.metadata.labels["release-name"] or "v" + app.status.operationState.syncResult.revision[:8],
+       spec.releaseTag:        app.metadata.labels["app.kubernetes.io/version"],
+       spec.commitSHA:         app.status.operationState.syncResult.revision,
+       spec.argoCDAppRefs:     [app.name],
+       spec.affectedNamespaces: app.status.resources.map(r => r.namespace).unique(),
+       spec.syncCompletedAt:    app.status.operationState.finishedAt,
+       spec.region:             globalConfig.spec.region,
+       spec.clusterId:          globalConfig.spec.clusterId,
+       spec.postReleaseWindowMins: 30
+     }
+     create(release)
+
+  4. Emit ReleaseEvent Signal to local BoltDB buffer:
+     emit to Kafka sre.signals.buffer: Signal{
+       type: "ReleaseEvent",
+       name: "ArgoCDSyncCompleted",
+       resource: release.name,
+       timestamp: now()
+     }
+
+  5. Check Errata matching on release:
+     for each image in app.status:
+       matches = errataCache.MatchVMImage(image)
+       if len(matches) > 0:
+         release.status.errataMatches = append(release.status.errataMatches, matches)
+
+  6. Set status.phase = Deployed
+     status.observationWindowEndAt = now() + 30m
+     update(release)
+     return RequeueAfter(30m)
 ```
 
 ---

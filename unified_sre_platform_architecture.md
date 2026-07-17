@@ -61,16 +61,17 @@ sequenceDiagram
 
 Kafka serves as the central nervous system. The table below outlines how topics route data between the spoke operator and central agents:
 
-| Topic Name | Key Format | Producer | Consumer | Payload Context |
+| Topic Name | Key Format | Producer(s) | Consumer(s) | Payload Context & Usage |
 | :--- | :--- | :--- | :--- | :--- |
-| `sre.telemetry.raw` | `{cluster-id}` | Spoke Operator | TriageAgent, Splunk Connect | Diagnostic check failures, heartbeat metrics. |
-| `sre.signals.buffer`| `{cluster-id}:{ns}:{name}` | Spoke Operator | Spoke Operator (Replay) | Startup signal replay cache (20-min window). |
-| `sre.incidents.lifecycle` | `{incident-fingerprint}` | Spoke Operator | Hub Mirror Reconciler | Incident state shifts (Detecting -> Active -> Resolved). |
-| `sre.commands` | `{cluster-id}:{cmd-name}` | Central Planner | Hub registration mirroring | Action requests (LiveMigrate, CordonNode). |
-| `sre.command-results`| `{command-name}` | Spoke Operator | RemediationPlannerAgent | Phase transitions (Executing, Approved, Succeeded). |
-| `sre.errata.cache` | `{cve-id}` | Hub Reconciler | Spoke Errata Consumer | OS advisories and kernel bug databases. |
-| `sre.crosscluster.reads` | `{cluster-id}:{kind}:{name}` | Hub Scraper | Central Agent Platform | Sanitized K8s configurations for RAG. |
-| `sre.audit` | `{cluster-id}` | Spoke / Hub | Splunk Connect | Immutable compliance log of all mutations. |
+| **`sre.telemetry.raw`** | `{cluster-id}` | `SREPolicyReconciler` (spoke) | `TriageAgent` (agent), Splunk Kafka Connect | Raw diagnostic check metrics, CNI/NTP offsets, and heartbeat logs. |
+| **`sre.signals.buffer`** | `{cluster-id}:{ns}:{name}` | Spoke Operator | Spoke Operator (Replay Cache) | Local BoltDB alert buffer for rule playback (20-min window). |
+| **`sre.incidents.lifecycle`** | `{incident-fingerprint}` | `SREIncidentReconciler` (spoke) | `TriageAgent` (agent), `RCAAgent` (agent), `SREClusterRegistrationReconciler` (hub), `PolicyLearnerAgent` (agent), Splunk Kafka Connect | Broadcasts incident phase transitions (Detecting -> Active -> Resolved). |
+| **`sre.commands`** | `{cluster-id}:{cmd-name}` | `RemediationPlannerAgent` (agent), `PolicyLearnerAgent` (agent for rules), `ClusterHealthScorerAgent` (agent), `ErrataCorrelatorAgent` (agent) | `SREClusterRegistrationReconciler` (hub) | Triggers creation of the local `SRECommand` CR on the target spoke cluster. |
+| **`sre.command-results`** | `{command-name}` | `SRECommandReconciler` (spoke) | `RemediationPlannerAgent`, `HumanLoopAgent`, Splunk Kafka Connect | Execution feedback (Success, Failure, Execution logs). |
+| **`sre.errata.cache`** | `{cve-id}` | `SREErrataCacheReconciler` (hub) | `SREPolicyReconciler` (spoke) consumer, `ErrataCorrelatorAgent` (agent), Splunk Kafka Connect | OS packages advisories and kernel vuln patches mirror. |
+| **`sre.crosscluster.reads`** | `{cluster-id}:{kind}:{name}` | `SRECrossClusterReadReconciler` (hub) | Central Agent tools layer, Splunk Kafka Connect | Sanitized spoke Kubernetes resource state queries for RAG prompts. |
+| **`sre.audit`** | `{cluster-id}` | `SRECommandReconciler` (spoke), `SREIncidentReconciler` (spoke), Hub operator (ManifestWork events) | `PolicyLearnerAgent` (agent), Splunk Kafka Connect | 90-day compliance logs auditing all mutations, bypasses, and approvals. |
+| **`sre.dead-letter`** | `{partition}:{offset}` | Any producer on retry exhaustion | Manual SRE review, Dead-letter monitor alert | DLQ for broker unreachable failures or parsing crashes. |
 
 ---
 

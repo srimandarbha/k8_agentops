@@ -71,8 +71,12 @@ The Spoke Operator registers and manages 6 namespaced Custom Resources:
 
 ### 3.2 `SREPolicy`
 * **Scope**: Namespaced.
-* **Purpose**: Coordinates all active checks (Metrics, Dell CSM, Portworx volumes, Errata caches) and schedules telemetry collection.
-* **Reconciler Flow**: Loops through all enabled checks, runs the execution handler, formats telemetry as standard CloudEvents, and writes them to `sre.telemetry.raw`.
+* **Purpose**: Coordinates all active checks and defines the **Signal Sources** (e.g., Prometheus metrics, Kubernetes events, Pod log regex patterns, OpenShift ClusterOperators, NTP drifts, CoreDNS error rates, Nexus pull failures) that stream into the BoltDB signal buffer.
+* **Reconciler Flow**: 
+  - Tracks configured `SignalSources` in parallel.
+  - Tail logs, filters cluster events, and queries metric endpoints.
+  - Converts matched conditions (e.g., matching a "failed to retrieve secret" environment plugin pattern) into structured `Signal` objects.
+  - Writes signals to the BoltDB buffer and publishes them to `sre.telemetry.raw`.
 
 ### 3.3 `SRECorrelationRule`
 * **Scope**: Namespaced.
@@ -84,12 +88,14 @@ The Spoke Operator registers and manages 6 namespaced Custom Resources:
 * **Purpose**: Represents the single source of truth for an operational incident's lifecycle on the spoke.
 * **Reconciler Flow**: 
   - Deduplicates matching incident fingerprints to avoid ticket storms.
-  - **Live State Harvesting**: When transitioning to `Active`, the reconciler gathers:
-    1. Pod phase status and status conditions (`Ready=False`).
-    2. Kubernetes events matching target resources.
-    3. **Log Tailing**: Fetches the last 50 lines of stdout/stderr logs from the target Pod for the bounded window: from **10 minutes before the incident creation timestamp** up to the current time (`[creationTimestamp - 10m, now()]`), filtering for lines containing `WARN`, `ERROR`, `FATAL`, or `panic`.
-    4. Stores this diagnostic text directly in `status.recentLogs` (providing instant context while remaining well under the 1.5MB etcd limit).
-  - Emits the aggregated lifecycle payload to Kafka to alert the Central Hub.
+  - **Diagnostic Auto-Collection**: When the incident transitions to `Active`, the `SREIncidentReconciler` automatically harvests a diagnostic bundle into `status.diagnostics` without requiring a central agent Kafka request:
+    1. **Live State**: Crawls VM/Node statuses, pod phases, and controller conditions.
+    2. **Events**: Collects active Kubernetes Events in the bounded window `[creationTimestamp - 10m, now()]`.
+    3. **Log Excerpts**: Fetches the last 100 stdout/stderr log lines of launcher and agent containers, filtering for matched regex patterns.
+    4. **Metrics Snapshot**: Captures current Prometheus/Thanos metric coordinates (e.g., `px_volume_replication_status`, CPU utilization).
+    5. **Release Context**: Cross-references against `SRERelease` to identify if the incident occurred within the 30-minute well-being window of a recent ArgoCD application sync.
+  - Emits the incident lifecycle event (with diagnostics embedded) to `sre.incidents.lifecycle` to kick off agent reasoning.
+  - SRECommands are reserved strictly for extended/on-demand diagnostics (e.g., broad Splunk log queries).
 
 ### 3.5 `SRERemediationPlan`
 * **Scope**: Namespaced.
@@ -100,6 +106,16 @@ The Spoke Operator registers and manages 6 namespaced Custom Resources:
 * **Scope**: Namespaced.
 * **Purpose**: Validates, reviews, and executes raw API operations.
 * **Reconciler Flow**: Computes the blast-radius score. If the action exceeds the auto-approval threshold defined in `SREPolicy`, it halts and requests human validation.
+
+### 3.7 `SRERelease`
+* **Scope**: Namespaced.
+* **Purpose**: Tracks ArgoCD Sync deployment events (manual GitOps integrations) and runs post-deployment health check loops.
+* **Reconciler Flow**:
+  - Watches ArgoCD `Application` resources for sync completion.
+  - On sync completion, creates a `SRERelease` CR, capturing the Helm charts, Git tag, commit SHA, and target namespaces.
+  - Automatically queries the `SREErrataCache` to check if any newly introduced package versions contain active critical/warning CVEs.
+  - Begins a 30-minute post-release well-being check. If any `SREIncident` occurs in the affected namespaces during this window, it tags the incident with the release context and updates `status.phase = Degraded`.
+  - Publishes a `ReleaseEvent` signal to `sre.signals.buffer`.
 
 ---
 
