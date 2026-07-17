@@ -82,8 +82,14 @@ The Spoke Operator registers and manages 6 namespaced Custom Resources:
 ### 3.4 `SREIncident`
 * **Scope**: Namespaced.
 * **Purpose**: Represents the single source of truth for an operational incident's lifecycle on the spoke.
-* **States**: `Detecting` -> `Active` -> `Remediating` -> `Resolved` / `Suppressed`.
-* **Reconciler Flow**: Deduplicates matching incident fingerprints to avoid ticket storms. When transitioning to `Active`, it emits lifecycle events to Kafka to alert the Central Hub.
+* **Reconciler Flow**: 
+  - Deduplicates matching incident fingerprints to avoid ticket storms.
+  - **Live State Harvesting**: When transitioning to `Active`, the reconciler gathers:
+    1. Pod phase status and status conditions (`Ready=False`).
+    2. Kubernetes events matching target resources.
+    3. **Log Tailing**: Fetches the last 50 lines of stdout/stderr logs from the target Pod for the bounded window: from **10 minutes before the incident creation timestamp** up to the current time (`[creationTimestamp - 10m, now()]`), filtering for lines containing `WARN`, `ERROR`, `FATAL`, or `panic`.
+    4. Stores this diagnostic text directly in `status.recentLogs` (providing instant context while remaining well under the 1.5MB etcd limit).
+  - Emits the aggregated lifecycle payload to Kafka to alert the Central Hub.
 
 ### 3.5 `SRERemediationPlan`
 * **Scope**: Namespaced.

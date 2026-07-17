@@ -31,21 +31,28 @@ sequenceDiagram
     Kafka->>Hub: Route Alert to TriageAgent
     Hub->>ServiceNow: Webhook: Create Incident Ticket (INC0001234)
     Hub->>Hub: Trigger RCAAgent (Observe -> Orient -> Decide)
-    Note over Hub: RCAAgent reads Logs, Metrics, Topology,<br/>and queries Qdrant for Runbooks
-    Hub->>Hub: RemediationPlannerAgent designs step-by-step commands
-    Hub->>Kafka: Emit SRECommand requested (sre.commands)
-    Kafka->>Spoke: Pull Command CR Creation
-    Note over Spoke: SRECommandReconciler evaluates Blast Radius
-    Spoke->>Kafka: Emit Command Pending Approval (sre.command-results)
-    Kafka->>Hub: Route to HumanLoopAgent
-    Hub->>ServiceNow: Update Incident: Inject Approval Link
-    Note over ServiceNow: On-Call Engineer clicks 'Approve'
-    ServiceNow->>Kafka: Emit Approval Event (sre.command-results)
-    Kafka->>Spoke: Command approved
-    Note over Spoke: SRECommandReconciler executes Cordon / LiveMigration
-    Spoke->>Kafka: Emit Command execution status (sre.command-results)
-    Kafka->>Hub: Plan status check -> Success
-    Hub->>ServiceNow: Resolve Incident Ticket
+    Note over Hub: RCAAgent reads Logs, Metrics, Topology,<br/>and queries PostgreSQL for Runbooks
+    Hub->>Hub: Check if target is GitOps Managed
+    alt Target is GitOps Managed
+        Hub->>Hub: RCAAgent constructs copy-paste YAML fix
+        Hub->>ServiceNow: Escalation: Requires Manual GitOps Update (Attach YAML)
+        Hub->>Kafka: Emit Teams Channel Notification Card (YAML Diff payload)
+    else Target is Runtime Resource
+        Hub->>Hub: RemediationPlannerAgent designs step-by-step commands
+        Hub->>Kafka: Emit SRECommand requested (sre.commands)
+        Kafka->>Spoke: Pull Command CR Creation
+        Note over Spoke: SRECommandReconciler evaluates Blast Radius
+        Spoke->>Kafka: Emit Command Pending Approval (sre.command-results)
+        Kafka->>Hub: Route to HumanLoopAgent
+        Hub->>ServiceNow: Update Incident: Inject Approval Link
+        Note over ServiceNow: On-Call Engineer clicks 'Approve'
+        ServiceNow->>Kafka: Emit Approval Event (sre.command-results)
+        Kafka->>Spoke: Command approved
+        Note over Spoke: SRECommandReconciler executes Cordon / LiveMigration
+        Spoke->>Kafka: Emit Command execution status (sre.command-results)
+        Kafka->>Hub: Plan status check -> Success
+        Hub->>ServiceNow: Resolve Incident Ticket
+    end
 ```
 
 ---
@@ -106,21 +113,38 @@ To proactively detect network partitions or cluster failures, the platform imple
 
 ---
 
-## 5. Command Execution & GitOps-Awareness Protocol
+## 5. Command Execution & GitOps-Exclusion Protocol
 
-To prevent configuration drift on resources managed by GitOps controllers (like ArgoCD), the platform divides actions into two categories:
+To ensure automated remediations never conflict with declarative configurations managed by GitOps controllers, the platform partitions operations:
 
-### 5.1 Direct Kubernetes API Mutations (Volatile Resources)
-Actions targeting cluster resources that are **not** managed by GitOps (e.g., live-migrating a VM, cordoning a node, deleting a stuck pod) are executed directly on the spoke cluster API server by the `SRECommandReconciler`.
+### 5.1 Direct Kubernetes API Mutations (Volatile / Runtime Resources)
+Remediations are focused **exclusively** on runtime cluster state that GitOps does not manage:
+* **Node Operations**: CordonNode, UncordonNode, DrainNode.
+* **VM Operations**: LiveMigrateVM (moving a VM's runtime launcher pod between physical nodes).
+* **Storage Operations**: Dynamic PVC expansion (if storage classes support online expansion without modifying the deployment manifests).
+* **Pod Operations**: Restarting transient system pods or clearing temporary local volume directories.
+These commands are executed directly on the spoke cluster API by the `SRECommandReconciler`.
 
-### 5.2 GitOps-Aware PR Generation (Desired State Resources)
-Actions targeting resources defined in Git repositories (e.g., expanding a PVC, updating replica counts, modifying environment variables) use the GitOps-Awareness flow:
-1. The `SRECommandReconciler` detects if the target resource namespace is managed by an ArgoCD application (using the Neo4j topology mapping).
-2. Instead of executing `client.Update()` on the cluster, the operator marks the command `Executing` and delegates PR creation to the Central Agent.
-3. The central `gitlab_tool` creates a branch, pushes the YAML change to the Git repository, and opens a Pull Request.
-4. The `SRECommand` status is updated with `gitops_pr_url`.
-5. Once the PR is merged by an engineer or auto-merged, ArgoCD syncs the change to the spoke cluster.
-6. The `SRECommandReconciler` detects the resource sync and transitions the command phase to `Succeeded`.
+### 5.2 GitOps Declarative Block (Escalation & Microsoft Teams Notification)
+If the `RCAAgent` or `SRECommandReconciler` detects that the target resource (e.g., a Deployment's replica count or a ConfigMap) is tagged with GitOps tracking labels:
+1. The operator **instantly blocks** the command and updates its status to `Failed` with the reason `GitOpsManagedExclusion`.
+2. The Central Agent intercepts this status shift via `sre.command-results`.
+3. The agent halts automated execution of the remediation plan.
+4. **YAML Generation**: The agent leverages the Vector DB runbooks to generate the **exact YAML diff block** needed to fix the drift or resource parameters.
+5. **Incident Escalation**: It updates the ServiceNow incident with the copy-pasteable YAML code block.
+6. **Microsoft Teams Card**: The agent calls the `AlertAPI` to post an **Adaptive Card to the SRE Teams Channel**, structured as follows:
+   ```json
+   {
+     "type": "AdaptiveCard",
+     "body": [
+       { "type": "TextBlock", "text": "GitOps Exclusion Triggered", "weight": "bolder", "color": "attention" },
+       { "type": "TextBlock", "text": "Incident: vm-stuck-image-pull | Cluster: prod-east-01" },
+       { "type": "TextBlock", "text": "Manual Action Required: Copy-paste the block below into your GitOps repo:" },
+       { "type": "CodeBlock", "language": "yaml", "code": "spec:\n  template:\n    spec:\n      containers:\n      - name: main\n        env:\n        - name: HTTPS_PROXY\n          value: squid-proxy-dmz.corp.internal:3128" }
+     ]
+   }
+   ```
+7. SRE team members copy this payload directly, merge it to Git, and wait for ArgoCD auto-sync to resolve the incident.
 
 ---
 

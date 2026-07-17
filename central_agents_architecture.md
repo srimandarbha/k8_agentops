@@ -47,7 +47,9 @@ The Hub runs seven specialized agents, each managing a specific domain of operat
 
 ### 2.2 RCAAgent (The Investigator)
 * **Function**: Runs a strict **OODA** (Observe-Orient-Decide-Act) troubleshooting loop.
-* **Process**: Gather logs (Splunk) and metrics (Prometheus), pull topology graphs (Neo4j), query runbooks (PostgreSQL), formulate a root-cause hypothesis, and pass the output to the planner.
+* **Process**: 
+  - **Observe Phase**: Performs a comprehensive log range search using the **Splunk REST API**. While the spoke operator only tails 50 local pod logs to avoid etcd bloat, the RCAAgent runs a wide-window query over the target cluster's logs (`[triggerTime - 15m, triggerTime + 1h]`), gathering up to 500 lines of system logs, hypervisor node events, CNI status codes, and related disk metrics in parallel.
+  - **Orient Phase**: Pulls topology graphs (Neo4j), queries runbooks and historical case studies (PostgreSQL), formulates a root-cause hypothesis, and passes the output to the planner.
 
 ### 2.3 RemediationPlannerAgent (The Architect)
 * **Function**: Receives the root-cause hypothesis and designs an orchestration plan.
@@ -82,7 +84,6 @@ Agents cannot modify resources directly. They reason and interact with Kubernete
 | `topology_tool.query`| Graph | Runs Cypher queries on Neo4j to build blast-radius dependencies. |
 | `vector_db.search` | Vector DB | Searches PostgreSQL using pgvector for semantic runbook matches and errata workarounds. |
 | `k8s_tool.create_cr` | Kubernetes| Creates SRECrossClusterRead or mirror incident CRDs on the Hub. |
-| `gitlab_tool.create_pr`| GitOps | Issues Git pull requests to update target manifests (GitOps-Awareness). |
 
 ---
 
@@ -94,7 +95,7 @@ The `RCAAgent` implements a strict structural layout for its diagnostic process:
 Observe ──── (Gathers logs, commits, metrics, and configurations in parallel)
   │
   ▼
-Orient ───── (Queries Neo4j for topology maps and Qdrant for relevant runbooks)
+Orient ───── (Queries Neo4j for topology maps and PostgreSQL pgvector for relevant runbooks)
   │
   ▼
 Decide ───── (Invokes the LLM using the structured JSON output schema)
@@ -149,7 +150,26 @@ This feedback mechanism guarantees that the central planner learns from mistakes
 
 ---
 
-## 6. Structured Context Processing (Prompt Engineering)
+## 6. User Interfaces & Integration
+
+The platform provides dedicated interfaces tailored for SRE engineers and platform maintainers:
+
+### 6.1 SRE ChatOps (Microsoft Teams Integration)
+Teams Adaptive Cards serve as the operational hub during incidents, providing interactive buttons mapping to API operations:
+- **`Approve`**: Sends an approval event to `sre.command-results`, authorizing the Spoke Operator to execute high-risk commands.
+- **`Reject`**: Cancels the command step and instructs `RemediationPlannerAgent` to execute rollback commands.
+- **`Escalate`**: Places the plan in manual mode, halts automated agent actions, and pages primary SRE on-call.
+- **`Re-evaluate`**: Clears the current diagnostic cache and triggers `RCAAgent` to run a fresh OODA loop.
+
+### 6.2 Agent Maintainer UI (Hub Admin Panel)
+Designed for developers tuning the agent platform:
+- **LangGraph Observability**: Utilizes LangSmith or LangFuse to log node latency, trace agent token costs, and track LLM inputs/outputs.
+- **Prompt Registry Manager**: Dynamically manages LLM system prompts without rebuilding Python container images.
+- **pgvector Runbook Portal**: Web portal to upload markdown runbooks, trigger semantic embeddings, and check retrieval accuracy scores.
+
+---
+
+## 7. Structured Context Processing (Prompt Engineering)
 
 To make correct decisions, the agent prompt is built dynamically using retrieved context. The agent is provided with:
 1. **The Telemetry Payload**: The raw Prometheus alert and the exact guest OS error message.

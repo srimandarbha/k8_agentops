@@ -7,11 +7,13 @@ The core philosophy of the SRE Operator is **"Smart Brain, Dumb Hands."** The Sp
 
 ## 1. Architectural Philosophy
 
-### 1.1 GitOps-First Remediation
-Directly modifying resources managed by GitOps controllers (like ArgoCD) leads to immediate state drift, which GitOps aggressively reverts, rendering automated remediation useless. The SRE Operator enforces a strict **GitOps-Awareness Protocol**:
-- When remediation targets a managed resource, the Operator intercepts the action.
-- Instead of executing directly on the cluster, the Operator converts the action into a PR against the Git repository managing that resource (e.g., `git-patch` action).
-- The cluster waits for GitOps to sync the new desired state, maintaining the single source of truth.
+### 1.1 GitOps-Awareness & Exclusion Protocol
+Directly modifying declarative resources managed by GitOps controllers (like ArgoCD) leads to immediate state drift, which GitOps aggressively reverts. To prevent drift fights and configuration corruption, the SRE Operator enforces a strict **GitOps-Exclusion Protocol**:
+- The operator never attempts to modify declarative resources (Deployments, replicas, config maps) that are managed by GitOps.
+- If a required remediation targets a GitOps-managed resource, the operator blocks the action, flags the command as `RequiresManualIntervention`, and delegates diagnosis to the Central Agents.
+- The Central Agents analyze the config error and generate the **exact suggested YAML diff / patch block** needed to correct the issue.
+- This copy-pasteable configuration fix is posted directly to **Microsoft Teams** (via webhook integration) and attached to the ServiceNow ticket, allowing SREs to quickly apply the patch to Git.
+- The operator focuses automated remediation **strictly** on runtime/infrastructure-level resources that are NOT managed by GitOps (e.g., CordonNode, LiveMigrateVM, deleting transient pods, Portworx storage expansions), ensuring zero conflict with GitOps controllers.
 
 ### 1.2 Event-Driven OODA Loop via Kafka
 To handle thousands of alerts without overwhelming Kubernetes control planes or creating complex inter-operator REST dependencies, the architecture utilizes Kafka.
@@ -47,7 +49,23 @@ The Hub acts as the aggregation point and "Smart Brain." It runs various special
 - **TopologyAgent**: Maintains a real-time Neo4j graph of all clusters, VMs, and PVCs, cleaning up stale nodes to ensure accurate blast-radius estimates.
 - **CapacityAgent**: Analyzes telemetry trends to proactively expand PVCs or propose Node additions before exhaustion occurs.
 
-## 4. Security & Compliance
+## 4. User Interfaces
+
+The platform splits user interaction into two interfaces based on user roles:
+
+### 4.1 SRE ChatOps (Microsoft Teams Integration)
+The primary operational interface for SRE engineers during an active incident. Teams Adaptive Cards deliver:
+- **Incident Summaries**: Aggregated root cause analysis and metric evidence.
+- **Interactive Action Buttons**: `Approve`, `Reject`, `Escalate`, or `Trigger Rollback` directly within the chat window.
+- **GitOps Diff Cards**: Copy-pasteable YAML blocks when declarative modifications are required.
+
+### 4.2 Agent Maintainer UI (Central Hub Dashboard)
+A specialized administrative interface for SRE platform maintainers to monitor and tune the AI engine:
+- **LangGraph Tracing (LangSmith/LangFuse)**: Visualizes the execution steps of the agent graphs to debug prompt latencies and tool usage.
+- **Neo4j Explorer**: Visual interface to traverse the active cluster topology.
+- **PostgreSQL pgvector Configurator**: Allows uploading new runbooks, editing embeddings, and auditing human feedback ratings.
+
+## 5. Security & Compliance
 
 - **Admission Webhooks**: Validating webhooks intercept `SRECommand` creation, ensuring that emergency bypass tokens are cryptographically valid, correctly scoped, and not expired.
 - **Audit Logging**: Every command execution, approval, and bypass is immutably written to the `sre.audit` Kafka topic, retained for 90 days for compliance reviews.

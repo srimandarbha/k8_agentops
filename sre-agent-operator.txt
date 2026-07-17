@@ -689,6 +689,201 @@ func Reconcile(ctx, req):
          for each match where match.severity >= spec.errataChecks.severityThreshold:
            if spec.errataChecks.autoCreateIncident:
              createSREIncidentIfNotExists(type=ErrataMatch, errataRefs=[match.cveId], ...)
+Consumers  :
+  - Manual SRE intervention
+  - Alert: operator emits Alert API call when DLQ message count > threshold
+
+Message Body:
+{
+  "specversion": "1.0",
+  "type": "io.sre.kubevirt.dlq.delivery-failed",
+  "data": {
+    "original_topic":   "sre.incidents.lifecycle",
+    "original_key":     "sha256:a1b2c3...",
+    "original_message": { ...original CloudEvent... },
+    "failure_reason":   "Kafka broker unreachable after 3 retries",
+    "retry_count":      3,
+    "first_failed_at":  "2026-07-13T14:30:00Z",
+    "last_failed_at":   "2026-07-13T14:32:00Z",
+    "cluster_id":       "prod-east-01"
+  }
+}
+```
+
+---
+
+## PART 3: CONTROLLER PSEUDO-CODE
+
+---
+
+### SREGlobalConfigReconciler
+
+```
+TRIGGER: SREGlobalConfig CREATE or UPDATE
+
+func Reconcile(ctx, req):
+
+  1. Fetch SREGlobalConfig
+     if NotFound: return no-requeue
+
+  2. KAFKA INIT:
+     if kafka.bootstrapServers changed or first init:
+       close existing KafkaWriter if exists
+       create new kafka.Writer{
+         brokers: spec.kafka.bootstrapServers,
+         tls:     loadTLSCert(spec.kafka.tlsSecretRef),
+         balancer: LeastBytes,
+         async:   false,
+         errorLogger: operatorLogger
+       }
+       store writer in shared ControllerManager context
+
+  3. ALERT API INIT:
+     alertClient = NewAlertAPIClient{
+       endpoint: spec.alertAPI.endpoint,
+       token:    loadSecret(spec.alertAPI.tokenSecretRef)
+     }
+     store alertClient in shared context
+
+  4. VAULT CLIENT INIT (if spec.vault configured):
+     vaultClient = vault.NewClient{
+       address:    spec.vault.address,
+       authMethod: "kubernetes",
+       role:       spec.vault.role
+     }
+     vaultClient.LoginWithK8sServiceAccount()
+     store vaultClient in shared context
+
+  5. SPLUNK INIT:
+     splunkClient = NewSplunkHECClient{
+       endpoint: spec.splunk.hecEndpoint,
+       token:    loadSecret(spec.splunk.hecTokenRef),
+       index:    spec.splunk.index,
+       sourceType: spec.splunk.sourceType
+     }
+     store splunkClient in shared context
+
+  6. GITLAB INIT (if spec.gitops.gitLabUrl set):
+     gitlabClient = gitlab.NewClient{
+       url:   spec.gitops.gitLabUrl,
+       token: loadSecret(spec.gitops.gitLabTokenRef)
+     }
+     store gitlabClient in shared context
+
+  7. Update status.initialized = true, status.kafkaConnected, status.vaultConnected
+  8. Emit audit event to Kafka sre.audit: "GlobalConfig initialized"
+  9. Return no-requeue (event-driven after this)
+```
+
+---
+
+### SREPolicyReconciler
+
+```go
+func (r *SREPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
+  // 1. Replay sre.signals.buffer to rebuild in-memory state (20 min lookback)
+  r.replaySignalBuffer(ctx)
+  
+  // 2. Re-evaluate all SRECorrelationRules against replayed buffer
+  r.evaluateAllRulesOnce()
+  
+  // 3. Start normal watch loops
+  return ctrl.NewControllerManagedBy(mgr).For(&v1alpha1.SREPolicy{}).Complete(r)
+}
+
+TRIGGER: SREPolicy CREATE/UPDATE + RequeueAfter(min_interval_seconds)
+
+func Reconcile(ctx, req):
+
+  1. Fetch SREPolicy
+     if NotFound: return no-requeue
+
+  2. Load SREGlobalConfig
+  3. Get persistent signal store (CorrelationEngine inverted index)
+     correlationEngine = r.CorrelationEngine
+
+  4. ── HEALTH CHECKS LOOP ──
+     for each check in spec.checks where check.enabled == true:
+
+       result = runCheck(check.category, check.name, targetNamespaces)
+
+       emit to Kafka sre.telemetry.raw:
+         key = cluster-id
+         body = buildTelemetryEvent(cluster-id, check, result)
+
+       set Prometheus gauge:
+         sre_check_result{cluster, namespace, resource, check_name} = result.failed ? 1 : 0
+
+       if result.failed:
+         signal = Signal{
+           ID:        uuid.New().String(),
+           Type:      "HealthCheck",
+           Name:      check.name,
+           Namespace: ns,
+           Resource:  canonicalRef(result.resource),
+           Timestamp: now(),
+         }
+         // DUAL-WRITE: Emit to Kafka buffer topic before adding to in-memory engine
+         emit to Kafka sre.signals.buffer (signal)
+         correlationEngine.OnSignalArrived(signal)
+
+  5. ── PROMETHEUS ALERTS VIA KAFKA CONSUMER ──
+     // Alerts are now consumed via the platform.alerts.processed Kafka topic
+     // (The operator NO LONGER polls Prometheus for alerts)
+     
+     // On Kafka message arrival (in a separate goroutine managed by the leader):
+     //   signal = parse(kafkaMessage)
+     //   emit to Kafka sre.signals.buffer (signal)
+     //   matchedRules = correlationEngine.OnSignalArrived(signal)
+     //   if len(matchedRules) > 0:
+     //     createSREIncidentFromRule(matchedRules[0], signal)
+     //   else:
+     //     createSREIncidentFromSingleAlert(signal)
+
+  6. ── STORAGE CHECKS ──
+     if spec.storageChecks.portworxEnabled:
+       pxStatus = portworxClient.GetClusterStatus()
+       for each node in pxStatus.degradedNodes:
+         signal = Signal{type: "MetricThreshold", name: "PortworxNodeDegraded", ...}
+         signalBuffer.add(signal)
+         emit to Kafka sre.telemetry.raw
+
+       for each pool in pxStatus.pools where pool.capacityPct > spec.storageChecks.capacityThresholdPercent:
+         createOrUpdateSREIncident(type=CapacityPressure, ...)
+
+     if spec.storageChecks.dellCsmEnabled:
+       csmStatus = csmClient.GetCSMStatus()
+       for each component where component.status != "Running":
+         signal = Signal{type: "HealthCheck", name: "DellCSMComponentDegraded", ...}
+         signalBuffer.add(signal)
+
+  7. ── VAULT CHECKS ──
+     if spec.vaultChecks configured:
+       sealStatus = vaultClient.GetSealStatus()
+       if sealStatus.sealed:
+         createSREIncident(type=VaultSealEvent, severity=P1Critical)
+
+       for each path in spec.vaultChecks.monitorPaths:
+         leaseInfo = vaultClient.GetLeaseInfo(path)
+         hoursUntilExpiry = leaseInfo.ttl.Hours()
+         if hoursUntilExpiry < spec.vaultChecks.leaseRenewalBufferHours:
+           createSREIncident(type=VaultCertExpiry, severity=P2High)
+
+       certExpiry = vaultClient.GetCertExpiry(spec.vaultChecks.pkiPath)
+       daysUntilExpiry = certExpiry.Sub(now()).Hours() / 24
+       if daysUntilExpiry < 7:
+         createSREIncident(type=VaultCertExpiry, severity=P1Critical)
+       else if daysUntilExpiry < spec.vaultChecks.certExpiryWarningDays:
+         createSREIncident(type=VaultCertExpiry, severity=P2High)
+
+  8. ── ERRATA CHECKS ──
+     if spec.errataChecks.enabled:
+       vms = listVMs(targetNamespaces)
+       for each vm in vms:
+         matches = errataCache.MatchVM(vm.labels["os.version"], vm.labels["kernel.version"])
+         for each match where match.severity >= spec.errataChecks.severityThreshold:
+           if spec.errataChecks.autoCreateIncident:
+             createSREIncidentIfNotExists(type=ErrataMatch, errataRefs=[match.cveId], ...)
 
   9. Update SREPolicy.status.lastReconcileAt = now()
   10. Return RequeueAfter(minIntervalSeconds(spec.checks))
@@ -723,21 +918,45 @@ func Reconcile(ctx, req):
   ── PHASE: "" (new, unset) ──
      Set phase = Detecting
      Set status.detectedAt = now()
-     Append AuditEntry: "Incident detected"
+     
+     // DIAGNOSTIC STATE HARVESTING:
+     triggerTime = incident.creationTimestamp
+     for each resource in spec.affectedResources:
+       if resource.kind == "Pod" or resource.kind == "VirtualMachine":
+         // Fetch last 50 lines of stdout/stderr from the window [triggerTime - 10m, now()]
+         targetPod = getTargetPodForResource(resource)
+         status.recentLogs[targetPod.name] = client.PodLogs(targetPod.name, tailLines=50, filter="WARN|ERROR|FATAL|panic|Panic", since=triggerTime - 10m, until=now())
+         status.observedPodState[targetPod.name] = getPodStatusAndConditions(targetPod.name)
+       
+       // Gather active K8s Events related to this resource in the window [triggerTime - 10m, now()]
+       status.observedEvents = append(status.observedEvents, getK8sEventsForResource(resource, since=triggerTime - 10m, until=now()))
+     
+     Append AuditEntry: "Incident detected, live log tails and cluster events harvested"
      emit to Kafka sre.incidents.lifecycle: phase-changed Detecting
      return RequeueAfter(2min)
 
   ── PHASE: Detecting ──
      if now() - status.detectedAt < correlationWindow (2min):
        return RequeueAfter(30s)
+     
+     // Transition to Active if correlation complete
+     Set status.phase = Active
+     status.activeAt = now()
+     emit to Kafka sre.incidents.lifecycle: phase-changed Active
+     return RequeueAfter(15s)
 
-       return RequeueAfter(1h)
-
+  ── PHASE: Active / Remediating ──
+     // Watch child commands or wait for resolution signal
+     if allRemediationCommandsSucceeded(incident):
+       Set status.phase = Resolved
+       status.resolvedAt = now()
+       emit to Kafka sre.incidents.lifecycle: phase-changed Resolved
+       return RequeueAfter(0)
      return RequeueAfter(15s)
 
   ── PHASE: Resolved ──
      if now() - status.resolvedAt > retention.maxAgeDays:
-       ...
+       delete(incident)
      return RequeueAfter(24h)
 ```
 
@@ -1588,10 +1807,19 @@ class RemediationPlannerAgent:
             emergency_bypass_token = hub_crypto.generate_bypass_jwt(incident_id, proposed_action["action"])
             approval_required = False
 
-        # Check if target resource is GitOps-managed (operator will handle, but note in reasoning)
-        gitops_note = ""
-        if proposed_action["action"] not in GITOPS_BYPASS_ACTIONS:
-            gitops_note = " Note: if target is ArgoCD-managed, operator will redirect to PR."
+        # Check if target resource is GitOps-managed (if so, block automated command and suggest YAML)
+        if blast_radius.get("is_gitops_managed", False):
+            yaml_patch = self._generate_suggested_yaml(proposed_action)
+            alert_api.post({
+                "unique_key":   incident_id + "-gitops-exclusion",
+                "severity":     "High",
+                "title":        "GitOps Exclusion: Manual YAML Update Required",
+                "description":  f"RCA: {rca_reasoning}\nTarget is GitOps managed. Apply this YAML patch:\n{yaml_patch}",
+                "cluster_id":   cluster_id,
+                "incident_ref": incident_id,
+                "extra_fields": { "gitops_yaml": yaml_patch }
+            })
+            return
 
         # Write SRECommand to Kafka (hub operator consumes → creates CR on spoke)
         command_name = f"sre-cmd-{proposed_action['action'].lower()}-{incident_id[-8:]}-{int(time.time())}"
@@ -1609,7 +1837,7 @@ class RemediationPlannerAgent:
                     "action":             proposed_action["action"],
                     "target_resource":    proposed_action["target"],
                     "parameters":         proposed_action.get("parameters", {}),
-                    "reasoning":          rca_reasoning + gitops_note,
+                    "reasoning":          rca_reasoning,
                     "proposed_by":        "agent:remediation-planner",
                     "approval_required":  approval_required,
                     "risk_level":         risk_level,
@@ -2741,9 +2969,9 @@ class TopologyAgent:
 
 ### Technology
 
-Recommended: **Qdrant** (in-cluster, REST + gRPC, efficient cosine similarity)
-Alternative: **ChromaDB** (simpler, good for PoC)
-Embedding Model: `text-embedding-3-small` (OpenAI) or `nomic-embed-text` (open-source, self-hosted)
+Recommended: **PostgreSQL pgvector** (REST + SQL, efficient HNSW cosine similarity index)
+Alternative: None (unified relational and vector database)
+Embedding Model: `text-embedding-3-small` (OpenAI, 1536 dimensions)
 
 ### Collections
 
