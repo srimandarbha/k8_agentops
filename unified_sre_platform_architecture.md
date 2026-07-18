@@ -46,8 +46,9 @@ sequenceDiagram
         Kafka->>Hub: Route to HumanLoopAgent
         Hub->>ServiceNow: Update Incident: Inject Approval Link
         Note over ServiceNow: On-Call Engineer clicks 'Approve'
-        ServiceNow->>Kafka: Emit Approval Event (sre.command-results)
-        Kafka->>Spoke: Command approved
+        ServiceNow->>Hub: Patch SRECommand.spec.approvedBy via Hub API
+        Hub->>Kafka: Emit Command Approved (sre.commands)
+        Kafka->>Spoke: Sync Approval to local CR
         Note over Spoke: SRECommandReconciler executes Cordon / LiveMigration
         Spoke->>Kafka: Emit Command execution status (sre.command-results)
         Kafka->>Hub: Plan status check -> Success
@@ -63,7 +64,7 @@ Kafka serves as the central nervous system. The table below outlines how topics 
 
 | Topic Name | Key Format | Producer(s) | Consumer(s) | Payload Context & Usage |
 | :--- | :--- | :--- | :--- | :--- |
-| **`sre.telemetry.raw`** | `{cluster-id}` | `SREPolicyReconciler` (spoke) | `TriageAgent` (agent), Splunk Kafka Connect | Raw diagnostic check metrics, CNI/NTP offsets, and heartbeat logs. |
+| **`sre.telemetry.raw`** | `{cluster-id}` | `SREPolicyReconciler` (spoke) | `TriageAgent` (agent), Splunk Kafka Connect | Raw diagnostic check metrics, CNI/NTP offsets, heartbeat logs, and `status.capabilities` matrix. |
 | **`sre.signals.buffer`** | `{cluster-id}:{ns}:{name}` | Spoke Operator | Spoke Operator (Replay Cache) | Local BoltDB alert buffer for rule playback (20-min window). |
 | **`sre.incidents.lifecycle`** | `{incident-fingerprint}` | `SREIncidentReconciler` (spoke) | `TriageAgent` (agent), `RCAAgent` (agent), `SREClusterRegistrationReconciler` (hub), `PolicyLearnerAgent` (agent), Splunk Kafka Connect | Broadcasts incident phase transitions (Detecting -> Active -> Resolved). |
 | **`sre.commands`** | `{cluster-id}:{cmd-name}` | `RemediationPlannerAgent` (agent), `PolicyLearnerAgent` (agent for rules), `ClusterHealthScorerAgent` (agent), `ErrataCorrelatorAgent` (agent) | `SREClusterRegistrationReconciler` (hub) | Triggers creation of the local `SRECommand` CR on the target spoke cluster. |
@@ -106,7 +107,7 @@ To proactively detect network partitions or cluster failures, the platform imple
 ```
 
 1. **Heartbeat Emission**: The `SREPolicyReconciler` on the spoke emits a `io.sre.kubevirt.telemetry.heartbeat` event to `sre.telemetry.raw` every **30 seconds**.
-2. **Central Tracking**: The `SREClusterRegistrationReconciler` on the Hub processes this heartbeat and updates `status.lastSeen` on the corresponding `SREClusterRegistration` CR.
+2. **Central Tracking**: The `SREClusterRegistrationReconciler` on the Hub processes this heartbeat and updates `status.lastSeen` and `status.capabilities` on the corresponding `SREClusterRegistration` CR. This capability matrix is used to gate `SRECommand` actions correctly.
 3. **Dead Man's Trigger**: If a cluster has not emitted a heartbeat for **90 seconds** (3 consecutive intervals):
    - The Hub controller marks the cluster `status.connected = false`.
    - The Hub operator generates a synthetic `ClusterUnreachable` incident and writes it to `sre.incidents.lifecycle`.
@@ -131,7 +132,7 @@ If the `RCAAgent` or `SRECommandReconciler` detects that the target resource (e.
 1. The operator **instantly blocks** the command and updates its status to `Failed` with the reason `GitOpsManagedExclusion`.
 2. The Central Agent intercepts this status shift via `sre.command-results`.
 3. The agent halts automated execution of the remediation plan.
-4. **YAML Generation**: The agent leverages the Vector DB runbooks to generate the **exact YAML diff block** needed to fix the drift or resource parameters.
+4. **YAML Generation**: The agent leverages the Vector DB runbooks to generate the **suggested YAML patch/diff block** needed to fix the drift or resource parameters.
 5. **Incident Escalation**: It updates the ServiceNow incident with the copy-pasteable YAML code block.
 6. **Microsoft Teams Card**: The agent calls the `AlertAPI` to post an **Adaptive Card to the SRE Teams Channel**, structured as follows:
    ```json
@@ -154,5 +155,5 @@ If the `RCAAgent` or `SRECommandReconciler` detects that the target resource (e.
 To support global deployments (e.g., US, EU, APAC) without experiencing WAN latency bottlenecks:
 - Regional Kafka clusters are deployed in each geographic region.
 - High-frequency, latency-sensitive traffic (like heartbeats and raw telemetry logs) stays entirely local to the region's Kafka cluster.
-- Low-frequency orchestration traffic (`sre.commands`, `sre.command-results`, and `sre.incidents.lifecycle`) is federated globally to the central primary Kafka cluster via **Confluent MirrorMaker 2 (MM2)**.
+- Low-frequency orchestration traffic (`sre.commands`, `sre.command-results`, and `sre.incidents.lifecycle`) is federated globally to the central primary Kafka cluster via **Strimzi / Apache Kafka MirrorMaker 2 (MM2)**.
 - Hub agents connect directly to the global primary Kafka cluster, allowing centralized control without regional latency overhead.

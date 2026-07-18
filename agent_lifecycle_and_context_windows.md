@@ -64,12 +64,13 @@ This payload is consumed by the Hub, serving as the baseline context for all cen
     "observed_pod_state": {
       "virt-launcher-db-vm-01": "Failed (ContainerEvicted) | Ready=False"
     },
-    "recent_logs": {
+    "log_excerpt_summary": {
       "virt-launcher-db-vm-01": "[WARN] guest agent heartbeat missed\n[ERROR] I/O write error on dev/vda\n[FATAL] launcher process killed: evict signal received"
     },
     "observed_events": [
       "2026-07-17T22:58:10Z: Pod/virt-launcher-db-vm-01 evicted due to Node worker-04 disk pressure"
     ],
+    "diagnostics_ref": "incident-diag-sre-incident-storage-deg-20260717",
     "timestamp": "2026-07-17T23:00:00Z"
   }
 }
@@ -218,11 +219,15 @@ To prevent automated scripts from taking unguided or dangerous actions, the plat
 The table below defines the strict RBAC / network access boundaries for the agent containers:
 
 | Agent Name | Prometheus | Splunk REST | Neo4j Graph | Postgres Vector | Kafka Produce | ServiceNow API |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| :--- | :---: | :---: | :---: | :---: | :--- | :---: |
 | **TriageAgent** | ❌ | ❌ | ❌ | ❌ | ❌ |  (Webhook) |
-| **RCAAgent** |  |  |  |  | ❌ | ❌ |
-| **PlannerAgent** | ❌ | ❌ | ❌ | ❌ |  | ❌ |
-| **CapacityAgent**|  | ❌ |  | ❌ |  | ❌ |
-| **ErrataAgent** | ❌ | ❌ | ❌ |  |  | ❌ |
-| **LearnerAgent** | ❌ | ❌ | ❌ |  |  | ❌ |
-| **HumanLoop** | ❌ | ❌ | ❌ | ❌ |  |  |
+| **RCAAgent** |  |  |  |  | `sre.commands`¹ | ❌ |
+| **PlannerAgent** | ❌ | ❌ | ❌ | ❌ | `sre.commands` | ❌ |
+| **CapacityAgent**|  | ❌ |  | ❌ | `sre.commands` | ❌ |
+| **ErrataAgent** | ❌ | ❌ | ❌ |  | `sre.commands` | ❌ |
+| **LearnerAgent** | ❌ | ❌ | ❌ |  | `sre.commands` | ❌ |
+| **HumanLoop** | ❌ | ❌ | ❌ | ❌ | `sre.commands`² |  |
+
+¹ RCAAgent is authorized to produce to `sre.commands` specifically to trigger high-priority diagnostic collection escalation commands (never writes to execution/remediation topics).
+² HumanLoopAgent is strictly authorized to produce to `sre.commands` only to trigger the `SafeAbort` cleanup command in timeout events. It is strictly blocked from producing to the spoke-exclusive `sre.command-results` topic.
+

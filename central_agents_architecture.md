@@ -6,7 +6,8 @@ The **Central Agent Platform** represents the "Smart Brain" of the architecture.
 
 ## 1. Technological Stack
 
-* **Agent Orchestration**: **LangGraph (Python)** — a stateful, cyclical graph-based framework for constructing multi-agent architectures with human-in-the-loop validation checkpoints.
+* **Agent Orchestration**: **LangGraph (Python)** — a stateful, cyclical graph-based framework for constructing multi-agent architectures with human-in-the-loop validation checkpoints. Uses a **PostgresSaver checkpointer** to persist execution graphs across hub pod restarts.
+* **Tool Abstraction Layer**: **ToolRegistry** — a thin Python wrapper that maps agent actions to dynamic methods, abstracting in-process imports from transport layers. This ensures stdio/HTTP+SSE-based Model Context Protocol (MCP) servers can be swapped in without modifying agent logic.
 * **Vector Database**: **PostgreSQL (with pgvector)** — standard relational engine with pgvector extension supporting cosine similarity vector lookup, relational SQL filters, and HNSW indexing.
 * **Graph Database**: **Neo4j** — hosts cluster topology relationships and executes Cypher queries to compute blast-radius scopes.
 * **Short-Term Storage & Cache**: **Redis** — maintains agent working memory, session locks, and temporary log buffers.
@@ -17,7 +18,7 @@ The **Central Agent Platform** represents the "Smart Brain" of the architecture.
 
 ## 2. Specialized Agent Roles
 
-The Hub runs seven specialized agents, each managing a specific domain of operations:
+The Hub runs eight specialized agents, each managing a specific domain of operations:
 
 ```
                   ┌──────────────────────────────────────────────┐
@@ -38,7 +39,7 @@ The Hub runs seven specialized agents, each managing a specific domain of operat
                   │           RemediationPlannerAgent            │
                   │         - Synthesizes Command Steps          │
                   │         - Checks Risk & Blast Radius         │
-                  └──────────────────────────────────────────────┘
+                  └──────────────────────┬───────────────────────┘
 ```
 
 ### 2.1 TriageAgent (The Router)
@@ -49,14 +50,14 @@ The Hub runs seven specialized agents, each managing a specific domain of operat
 * **Function**: Runs a strict **OODA** (Observe-Orient-Decide-Act) troubleshooting loop.
 * **Process**: 
   - **Observe Phase**: 
-    1. Reads the **`status.diagnostics`** block directly from the incoming `SREIncident` CR (containing auto-collected Pod logs, K8s Events, and Prometheus metrics snapshotted at trigger time).
+    1. Reads the size-capped diagnostic summary directly from the incoming `sre.incidents.lifecycle` event. If a deeper forensic analysis is required, it dynamically fetches the full, un-truncated diagnostic logs/events from the ConfigMap referenced in `status.diagnosticsRef` via `ToolRegistry`.
     2. Inspects `status.diagnostics.releaseContext` to check if the failure is correlated with a recent manual GitOps sync (`SRERelease`).
-    3. Runs an extended log range query via the **Splunk REST API** (`[triggerTime - 15m, triggerTime + 1h]`) to fetch hypervisor-level details, Multus CNI statuses, or Portworx OSD logs.
+    3. Runs an extended log range query via the **Splunk REST API** using a query window bounded to `[triggerTime - 15m, now()]` (ending at `now()` to prevent querying log events that have not occurred yet) targeting the VM launcher node.
   - **Orient Phase**: Pulls topology graphs (Neo4j), queries runbooks and historical case studies (PostgreSQL), formulates a root-cause hypothesis, and passes the output to the planner.
 
 ### 2.3 RemediationPlannerAgent (The Architect)
-* **Function**: Receives the root-cause hypothesis and designs an orchestration plan.
-* **Process**: Translates the proposed mitigation into sequential or parallel `SRECommand` CRD instructions and writes the plan to `sre.commands`.
+* **Function**: Receives the root-cause hypothesis and designs an orchestration plan via intent-based indirection.
+* **Process**: Instead of directly synthesizing raw YAML actions, the LLM selects intents from a versioned **`WorkflowCatalog`** (e.g., "intent: recover kubevirt-handler"). A deterministic policy table then maps the intent and cluster capabilities to the correct underlying `SRECommand` CRD instructions and writes the plan to `sre.commands`. This reduces hallucination risk and standardizes blast-radius scoring.
 
 ### 2.4 CapacityAgent (Proactive Forecaster)
 * **Function**: Proactively checks cluster capacity constraints using Prometheus range queries.
@@ -74,6 +75,10 @@ The Hub runs seven specialized agents, each managing a specific domain of operat
 * **Function**: Manages human-in-the-loop approvals.
 * **Process**: Watches commands pending manual confirmation. If an approval times out (based on severity thresholds), it cancels the action, triggers a `SafeAbort` rollback command, and escalates the ServiceNow incident to page on-call SREs.
 
+### 2.8 FleetCorrelationAgent (Pattern Detector)
+* **Function**: Detects platform-level bugs by identifying correlated incidents across multiple clusters.
+* **Process**: Groups active mirror incidents by signature (e.g., matching triggering alerts, OCP version, storage provider). Marks redundant incidents as duplicates (suppressing redundant RCAAgent LLM invocations) and creates unified fleet-level incident tickets.
+
 ---
 
 ## 3. Agent Toolset Integration
@@ -90,21 +95,85 @@ Agents cannot modify resources directly. They reason and interact with Kubernete
 
 ---
 
-## 4. The OODA Loop Execution Engine
+## 4. LangGraph Stateful Orchestration Graph
 
-The `RCAAgent` implements a strict structural layout for its diagnostic process:
+To prevent lost context on Hub restarts and enable first-class interrupts for human loops, the Central Agent Platform avoids procedural python function-chaining. Instead, it relies on a typed `IncidentState` managed by a LangGraph `StateGraph` with a supervisor node and durable PostgreSQL checkpoints:
 
-```
-Observe ──── (Gathers logs, commits, metrics, and configurations in parallel)
-  │
-  ▼
-Orient ───── (Queries Neo4j for topology maps and PostgreSQL pgvector for relevant runbooks)
-  │
-  ▼
-Decide ───── (Invokes the LLM using the structured JSON output schema)
-  │
-  ▼
-Act ──────── (Emits SRECommands to Kafka and logs audit data to sre.audit)
+```python
+from typing import TypedDict, Literal, Optional
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.postgres import PostgresSaver
+
+class IncidentState(TypedDict):
+    incident_id: str
+    cluster_id: str
+    incident_data: dict
+    diagnostics: Optional[dict]          # from operator's ConfigMap/Kafka summary
+    rag_context: Optional[dict]          # runbooks + historical_incidents + errata
+    topology_context: Optional[dict]     # Neo4j blast radius
+    rca_decision: Optional[dict]         # enforced schema output
+    remediation_plan: Optional[dict]
+    command_results: list
+    route: Optional[str]                 # supervisor's routing decision
+    human_feedback: Optional[dict]
+
+def supervisor_node(state: IncidentState) -> IncidentState:
+    """The central router node. Determines the next node based on current state."""
+    if state.get("rca_decision") is None:
+        state["route"] = "rca_agent"
+    elif state["rca_decision"].get("action") == "ESCALATE":
+        state["route"] = "human_loop_agent"
+    elif state.get("remediation_plan") is None:
+        state["route"] = "remediation_planner_agent"
+    elif not all(c["phase"] in ("Succeeded", "Failed") for c in state.get("command_results", [])):
+        state["route"] = "wait_for_commands"
+    else:
+        state["route"] = END
+    return state
+
+def route_decision(state: IncidentState) -> str:
+    return state["route"]
+
+def rca_node(state: IncidentState) -> IncidentState:
+    # Observe -> Orient -> Decide. Interacts with Postgres / Neo4j via ToolRegistry
+    obs = ToolRegistry.invoke("splunk_tool.query", incident_id=state["incident_id"])
+    context = ToolRegistry.invoke("vector_db.search", query=state["incident_data"]["title"])
+    state["diagnostics"] = obs
+    state["rag_context"] = context
+    state["rca_decision"] = decide_cause(obs, context)
+    return state
+
+def remediation_planner_node(state: IncidentState) -> IncidentState:
+    state["remediation_plan"] = build_plan(state["rca_decision"], state["cluster_id"])
+    emit_commands_to_kafka(state["remediation_plan"])
+    return state
+
+def human_loop_node(state: IncidentState) -> IncidentState:
+    # StateGraph interrupt point. Graph state is persisted to Postgres;
+    # Execution halts until Teams/ServiceNow callback triggers resume.
+    state["human_feedback"] = None
+    return state
+
+# Graph assembly
+graph = StateGraph(IncidentState)
+graph.add_node("supervisor", supervisor_node)
+graph.add_node("rca_agent", rca_node)
+graph.add_node("remediation_planner_agent", remediation_planner_node)
+graph.add_node("human_loop_agent", human_loop_node)
+graph.set_entry_point("supervisor")
+
+graph.add_conditional_edges("supervisor", route_decision, {
+    "rca_agent": "rca_agent",
+    "remediation_planner_agent": "remediation_planner_agent",
+    "human_loop_agent": "human_loop_agent",
+    "wait_for_commands": END, # wait for external Kafka trigger to resume
+    END: END
+})
+graph.add_edge("rca_agent", "supervisor")
+graph.add_edge("remediation_planner_agent", "supervisor")
+graph.add_edge("human_loop_agent", "supervisor")
+
+compiled = graph.compile(checkpointer=PostgresSaver(conn_pool))
 ```
 
 ### 4.1 Schema Enforcement (Structured Output)
@@ -117,6 +186,8 @@ Every LLM call within the agent graph is validated against a strict JSON schema:
 ### 4.2 Proactive vs. Reactive Execution
 - **Reactive Workflow**: Triggered by a Kafka event -> TriageAgent -> RCAAgent -> Execution Plan -> Operator acting on cluster.
 - **Proactive Workflow**: Triggered by Cron -> CapacityAgent -> Linear Regression -> Kafka `sre.commands` -> Operator expanding storage or scaling nodes.
+
+---
 
 ## 5. Agent Long-Term Memory & Human Feedback Loop
 
@@ -169,6 +240,15 @@ Designed for developers tuning the agent platform:
 - **LangGraph Observability**: Utilizes LangSmith or LangFuse to log node latency, trace agent token costs, and track LLM inputs/outputs.
 - **Prompt Registry Manager**: Dynamically manages LLM system prompts without rebuilding Python container images.
 - **pgvector Runbook Portal**: Web portal to upload markdown runbooks, trigger semantic embeddings, and check retrieval accuracy scores.
+
+### 6.3 Agent Platform Observability
+The Hub exports specific Prometheus metrics to track the LLM platform's cost, performance, and calibration:
+- `sre_agent_llm_tokens_total{agent, incident_type}`: Tracks token consumption.
+- `sre_agent_llm_cost_usd_total{agent}`: Tracks financial spend per agent.
+- `sre_agent_confidence_vs_outcome{bucket}`: Calibrates the agent's self-reported confidence against actual resolution success.
+- `sre_agent_human_override_rate{incident_type}`: Tracks how often engineers reject the plan.
+- `sre_agent_rollback_frequency{action}`: Tracks validation check failures.
+- `sre_agent_reasoning_latency_seconds{agent, phase}`: Tracks time spent in Observe vs Orient vs Decide phases.
 
 ---
 
@@ -229,3 +309,13 @@ class GatewayTokenRefresher:
         self.expiry_time = datetime.utcnow() + timedelta(seconds=expires_in)
 ```
 This refresher is registered as a custom authentication middleware in the agent's LangGraph model client context.
+
+---
+
+## 9. Stateful Systems & Disaster Recovery
+
+The central Hub relies on several stateful databases that require strict backup, DR runbooks, and HA configurations to prevent the SRE platform from becoming a single point of failure during a critical outage:
+- **PostgreSQL / pgvector**: Stores `historical_incidents` and runbook embeddings. Requires continuous WAL archiving and daily snapshots.
+- **Neo4j**: Stores the cluster topology graph. Requires regular backups, although the graph can be rebuilt by re-ingesting ACM hub data if lost.
+- **Redis**: Caches LLM context windows and session states. Should be configured with persistence (AOF/RDB) or treated as volatile with the understanding that active RCA loops will restart on failure.
+- **Kafka**: The central event backbone (and regional federated clusters) requires strict replication (min. ISR) and topic retention policies.

@@ -1,3 +1,4 @@
+**Historical snapshot, superseded by plan.md and AGENTS.md — do not treat as current design.**
 <thinking>
 The user wants:
 1. No document creation - just a message (easy to copy/paste)
