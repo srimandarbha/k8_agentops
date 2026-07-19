@@ -56,6 +56,39 @@ sequenceDiagram
     end
 ```
 
+### 2.1 VMware Migration Rollback OODA Loop Sequence
+
+The sequence diagram below shows how a migration failure is handled across the VMware boundary under the VMware Boundary Exclusion Protocol:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Spoke as Spoke Cluster (Operator)
+    participant Kafka as Kafka Event Bus
+    participant Hub as Hub Cluster (Agents)
+    participant ServiceNow as ServiceNow / AlertAPI
+    participant MigrationApp as Migration App / EDA
+
+    Spoke->>Kafka: Emit Migration VM Failure (sre.incidents.lifecycle)
+    Kafka->>Hub: Route Alert to TriageAgent
+    Hub->>ServiceNow: Webhook: Create Incident Ticket (INC0005678)
+    Hub->>Hub: Trigger RCAAgent (Observe -> Orient -> Decide)
+    Note over Hub: RCAAgent reads virt-v2v logs and queries vector DB
+    Hub->>Hub: Check if failure is structural (unsupported VM config)
+    alt Yes -> Recommend Rollback to VMware
+        Hub->>Kafka: Emit Rollback Recommendation (migration.failures)
+        Kafka->>MigrationApp: Consume Rollback request
+        Note over MigrationApp: EDA runs Playbook to power on VM in vCenter and adjust DNS
+        MigrationApp->>Kafka: Emit Rollback completion status (migration.hooks.status)
+        Kafka->>Hub: Route status to SREIncidentReconciler
+        Hub->>ServiceNow: Resolve Incident (Rollback Succeeded)
+    else No -> Auto-retry
+        Hub->>Kafka: Emit Retry Command (sre.commands)
+        Kafka->>Spoke: Re-trigger MTV Migration
+    end
+```
+
+
 ---
 
 ## 3. Kafka Event Backbone (Topic Registry)
@@ -73,6 +106,16 @@ Kafka serves as the central nervous system. The table below outlines how topics 
 | **`sre.crosscluster.reads`** | `{cluster-id}:{kind}:{name}` | `SRECrossClusterReadReconciler` (hub) | Central Agent tools layer, Splunk Kafka Connect | Sanitized spoke Kubernetes resource state queries for RAG prompts. |
 | **`sre.audit`** | `{cluster-id}` | `SRECommandReconciler` (spoke), `SREIncidentReconciler` (spoke), Hub operator (ManifestWork events) | `PolicyLearnerAgent` (agent), Splunk Kafka Connect | 90-day compliance logs auditing all mutations, bypasses, and approvals. |
 | **`sre.dead-letter`** | `{partition}:{offset}` | Any producer on retry exhaustion | Manual SRE review, Dead-letter monitor alert | DLQ for broker unreachable failures or parsing crashes. |
+| **`migration.prechecks.results`** | `{plan_id}:{vm_id}` | FastAPI / Airflow | React UI, EDA | Results of the pre-migration checks. |
+| **`migration.prechecks.failed`** | `{plan_id}:{check_type}` | FastAPI | EDA → ServiceNow, SRE notification | Alerting for critical precheck failures. |
+| **`migration.plans.created`** | `{plan_id}` | FastAPI | EDA, GBGF notification service | Trigger for pre-migration notifications. |
+| **`migration.jobs.trigger`** | `{plan_id}:{vm_id}` | FastAPI scheduler | EDA → Ansible → MTV | Triggers the execution of the forklift plan. |
+| **`migration.hooks.status`** | `{plan_id}:{vm_id}:{hook_type}` | Migration watcher | FastAPI → Postgres | Feedback channel for prehook/posthook execution. |
+| **`migration.progress`** | `{plan_id}:{vm_id}` | Migration watcher | FastAPI → WebSocket → React UI | Live VM migration bandwidth/progress data. |
+| **`migration.failures`** | `{plan_id}:{vm_id}` | Migration watcher | FastAPI → Postgres, SRE alert | Error telemetry and conversion logs path. |
+| **`migration.rollback.requested`** | `{plan_id}:{vm_id}` | FastAPI (SRE action) | EDA → Ansible rollback playbook | Escalation request for VMware-side rollback. |
+| **`migration.vcenter.add`** | `{vcenter_id}` | FastAPI | EDA → Ansible → Airflow DAG | Requests automated discovery of new VMware scope. |
+| **`cluster.builds.requested`** | `{cluster_id}` | FastAPI | EDA → Ansible → ACM | Demands target cluster creation for scaling. |
 
 ---
 

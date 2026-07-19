@@ -44,24 +44,24 @@ The Hub runs eight specialized agents, each managing a specific domain of operat
 
 ### 2.1 TriageAgent (The Router)
 * **Ingestion**: Consumes `sre.incidents.lifecycle` messages.
-* **Function**: Registers the incident in Redis, determines initial routing to specialist agents, and creates the baseline ServiceNow incident (via AlertManager webhook mappings) for P1 Critical failures.
+* **Function**: Registers the incident in Redis, determines initial routing to specialist agents, and creates the baseline ServiceNow incident (via AlertManager webhook mappings) for P1 Critical failures. Also triages migration wave incidents (e.g. `MigrationWindowAtRisk`).
 
 ### 2.2 RCAAgent (The Investigator)
 * **Function**: Runs a strict **OODA** (Observe-Orient-Decide-Act) troubleshooting loop.
 * **Process**: 
   - **Observe Phase**: 
     1. Reads the size-capped diagnostic summary directly from the incoming `sre.incidents.lifecycle` event. If a deeper forensic analysis is required, it dynamically fetches the full, un-truncated diagnostic logs/events from the ConfigMap referenced in `status.diagnosticsRef` via `ToolRegistry`.
-    2. Inspects `status.diagnostics.releaseContext` to check if the failure is correlated with a recent manual GitOps sync (`SRERelease`).
-    3. Runs an extended log range query via the **Splunk REST API** using a query window bounded to `[triggerTime - 15m, now()]` (ending at `now()` to prevent querying log events that have not occurred yet) targeting the VM launcher node.
-  - **Orient Phase**: Pulls topology graphs (Neo4j), queries runbooks and historical case studies (PostgreSQL), formulates a root-cause hypothesis, and passes the output to the planner.
+    2. Inspects `status.diagnostics.releaseContext` to check if the failure is correlated with a recent manual GitOps sync (`SRERelease`) or a VM migration run (`SREMigrationWave`).
+    3. Runs an extended log range query via the **Splunk REST API** using a query window bounded to `[triggerTime - 15m, now()]` (ending at `now()`) targeting the VM launcher node or Windows Guest health events (event ID 1001 for BSOD).
+  - **Orient Phase**: Pulls topology graphs (Neo4j) including VMware migration edges, queries runbooks (including pre-seeded MTV/virt-v2v signatures) and historical case studies (PostgreSQL), formulates a root-cause hypothesis, and passes the output to the planner.
 
 ### 2.3 RemediationPlannerAgent (The Architect)
 * **Function**: Receives the root-cause hypothesis and designs an orchestration plan via intent-based indirection.
-* **Process**: Instead of directly synthesizing raw YAML actions, the LLM selects intents from a versioned **`WorkflowCatalog`** (e.g., "intent: recover kubevirt-handler"). A deterministic policy table then maps the intent and cluster capabilities to the correct underlying `SRECommand` CRD instructions and writes the plan to `sre.commands`. This reduces hallucination risk and standardizes blast-radius scoring.
+* **Process**: Instead of directly synthesizing raw YAML actions, the LLM selects intents from a versioned **`WorkflowCatalog`** (e.g., "intent: retry-migration" or "intent: propose-rollback"). A deterministic policy table then maps the intent and cluster capabilities to the correct underlying `SRECommand` CRD instructions or emits a rollback recommendation to Kafka. This reduces hallucination risk and enforces the VMware Boundary Exclusion Protocol.
 
 ### 2.4 CapacityAgent (Proactive Forecaster)
 * **Function**: Proactively checks cluster capacity constraints using Prometheus range queries.
-* **Process**: Runs linear regression models on node memory, CPU, and storage. If utilization is projected to exceed thresholds (95% Critical / 85% Warning) within **7 days**, it automatically issues a PVC expansion command.
+* **Process**: Runs linear regression models on node memory, CPU, and storage. If utilization is projected to exceed thresholds (95% Critical / 85% Warning) within **7 days**, it automatically issues a PVC expansion command. Under the migration stream, it flags when a target namespace's storage pool has insufficient runway for incoming VM migration batches.
 
 ### 2.5 ErrataCorrelatorAgent (Compliance Audit)
 * **Function**: Periodically audit node and VM configurations against Red Hat security errata.
@@ -76,8 +76,21 @@ The Hub runs eight specialized agents, each managing a specific domain of operat
 * **Process**: Watches commands pending manual confirmation. If an approval times out (based on severity thresholds), it cancels the action, triggers a `SafeAbort` rollback command, and escalates the ServiceNow incident to page on-call SREs.
 
 ### 2.8 FleetCorrelationAgent (Pattern Detector)
-* **Function**: Detects platform-level bugs by identifying correlated incidents across multiple clusters.
-* **Process**: Groups active mirror incidents by signature (e.g., matching triggering alerts, OCP version, storage provider). Marks redundant incidents as duplicates (suppressing redundant RCAAgent LLM invocations) and creates unified fleet-level incident tickets.
+* **Function**: Detects platform-level bugs by identifying correlated incidents across multiple clusters or single-cluster waves.
+* **Process**: 
+  - Groups active mirror incidents by signature (e.g., matching triggering alerts, OCP version, storage provider). Marks redundant incidents as duplicates (suppressing redundant RCAAgent LLM invocations) and creates unified fleet-level incident tickets.
+  - **Systemic Wave Failure Folding**: Groups repeating migration precheck or execution signals (e.g., repeating VDDK errors) across >=3 VMs in the same wave into a single `MigrationWaveSystemicFailure` incident and triggers `PauseMigrationWave` to prevent cascade failure loops.
+
+### 2.9 ReleaseAnalyzerAgent (GitOps Releases)
+* **Function**: Tracks GitOps release tags and analyzes merged configuration changes.
+* **Process**:
+  - Periodically polls the Git repository (using the `git_repo.analyze_commits` tool matching the `redhat-cop/gitops-standards-repo-template` layout) or triggers on tag merge webhooks to `sit` and `main` branches.
+  - Analyzes commit manifests to identify and categorize:
+    - **Upgrades**: Operator/CNV/OCP version bumps.
+    - **Config Changes**: ConfigMap, Secret, or system parameter shifts.
+    - **New Components**: Introduction of new OCP operators or application resources.
+    - **New VLAN Additions**: VLAN additions, Multus `NetworkAttachmentDefinitions`, or bridge mappings.
+  - Embeds these changes and syncs them to pgvector `platform_configs` to assist `RCAAgent` in immediate incident correlation.
 
 ---
 
@@ -187,6 +200,24 @@ Every LLM call within the agent graph is validated against a strict JSON schema:
 - **Reactive Workflow**: Triggered by a Kafka event -> TriageAgent -> RCAAgent -> Execution Plan -> Operator acting on cluster.
 - **Proactive Workflow**: Triggered by Cron -> CapacityAgent -> Linear Regression -> Kafka `sre.commands` -> Operator expanding storage or scaling nodes.
 
+### 4.3 VMware Boundary Exclusion Protocol & Division of Responsibilities
+
+Cortex enforces strict operational separation at the virtualization boundary to protect cluster state, avoid credentials sprawl, and prevent split-brain actions. 
+
+#### A. Division of Responsibilities ("Who Does What")
+
+| Role / Component | Responsibilities | Execution Boundary |
+|---|---|---|
+| **Central Agent (Hub)** | 1. Fetches migration wave/VM coordinates from CRDs.<br/>2. Resolves CR window/timeframe constraints and checks if MTV can complete on time.<br/>3. Aggregates and stores diagnostics/evidence (prechecks, virt-v2v, hooks).<br/>4. Identifies repeated failures via RAG vector search.<br/>5. Creates Red Hat support cases and attaches evidence.<br/>6. Decides and triggers retry/rollback actions. | **Reads from OCP; Calls MCP tools; Writes SNOW/RH support** |
+| **Migration App (MCP Server)** | 1. Exposes the Model Context Protocol (MCP) server.<br/>2. Receives `trigger_retry` / `trigger_rollback` tool calls from Hub.<br/>3. Translates calls into Ansible playbook executions.<br/>4. Syncs VM status updates to Postgres. | **Translates MCP → Ansible Playbooks** |
+| **Ansible Engine** | 1. Performs vCenter mutations (powering VMs on/off, snapshots).<br/>2. Adjusts VMware networking & DNS routing.<br/>3. Calls Forklift API to re-trigger or clean up plans on OCP. | **Executes vCenter and OCP infrastructure jobs** |
+| **Spoke Operator (Dumb Hands)** | 1. Watches native Forklift CRDs on the local spoke.<br/>2. Evaluates local rules and emits raw status metrics and hook job output to Kafka.<br/>3. Recomputes dynamic wave throughput on `SREMigrationWave` CR. | **Stateless watching and telemetry forwarding** |
+
+#### B. MCP Trigger Flow
+1. **Tool Invocation**: If `RCAAgent` decides that a VM migration failed structurally and requires a rollback, the `RemediationPlannerAgent` invokes the `migration_app.trigger_rollback(vm_id)` tool directly on the **Migration App MCP Server** (relying on stdio/SSE-based MCP transports).
+2. **Decoupled Playbook Execution**: The Migration App MCP Server initiates the appropriate Ansible rollback playbook asynchronously.
+3. **Execution Feedback**: The playbook updates the VMware state (e.g., power-on, DNS adjustments) and writes execution completion statuses to Kafka (`migration.hooks.status` / `migration.rollback.requested`), which the `SREIncidentReconciler` correlates to close the incident.
+
 ---
 
 ## 5. Agent Long-Term Memory & Human Feedback Loop
@@ -221,6 +252,15 @@ If past incident actions were flagged as bad or dangerous by human engineers, th
 > *"WARNING: On 2026-06-01, an agent attempted to restart CNI pods for a similar alert on prod-east-01. The human rated this 1 star, commenting: 'Do NOT restart CNI during active VM live migrations—it causes virtual networks to disconnect'. Do NOT propose restarting CNI."*
 
 This feedback mechanism guarantees that the central planner learns from mistakes and respects specific environment constraints.
+
+### 5.3 Knowledge Seeding & Topology Mapping
+
+To maximize reasoning accuracy for the migration stream:
+
+1. **Pre-Seeded Runbooks**: The PostgreSQL vector database is pre-loaded with known Forklift/MTV error signatures (e.g., VDDK path issues, RDM mappings, virt-v2v conversion failures) to guarantee high confidence matching from day one.
+2. **Topology Graph Mapping**: Neo4j maps migration lineage:
+   `(:VM)-[:MIGRATED_FROM {original_host: string, vcenter: string, migration_date: string}]->(:VMwareSource)`
+   This allows the agents to run Cypher traversals to immediately identify if a guest stability issue is post-migration correlated.
 
 ---
 

@@ -111,6 +111,7 @@ CREATE TABLE runbooks (
     category TEXT NOT NULL,
     components TEXT[] NOT NULL,
     min_ocp_version TEXT,
+    required_capabilities JSONB, -- capabilities requirements mapping (e.g. {"storage": {"provider": "portworx"}})
     is_internal BOOLEAN DEFAULT true,
     last_updated TIMESTAMPTZ DEFAULT NOW(),
     embedding vector(1536) -- openai text-embedding-3-small dimension
@@ -159,6 +160,7 @@ SELECT title, content, 1 - (embedding <=> %(query_vector)s) AS similarity
 FROM runbooks
 WHERE %(ocp_version)s >= min_ocp_version
   AND %(component)s = ANY(components)
+  AND (required_capabilities IS NULL OR required_capabilities @> %(cluster_capabilities)s)
 ORDER BY embedding <=> %(query_vector)s
 LIMIT 3;
 ```

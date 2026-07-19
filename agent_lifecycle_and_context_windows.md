@@ -101,8 +101,8 @@ Below is the execution detail for each agent running in the Hub LangGraph framew
   - The initial telemetry payload from the operator.
   - Custom system prompts explaining KubeVirt CNI, OVN, and storage paradigms.
 * **Observe Phase (Data Gathering)**:
-  - Runs a Splunk REST API query for the time range `[triggerTime - 15m, triggerTime + 1h]` targeting the VM launcher node.
-  - Queries Neo4j for the topological path: `VM -> Pod -> Node -> Storage Pool`.
+  - Runs a Splunk REST API query for the time range `[triggerTime - 15m, now()]` targeting the VM launcher node or Windows Guest health events.
+  - Queries Neo4j for the topological path: `VM -> Pod -> Node -> Storage Pool` (including migration lineage edges).
 * **Orient Phase (RAG Search)**:
   - Queries the PostgreSQL `runbooks` and `historical_incidents` tables using the embedding of `triggering_alerts` (similarity match).
 * **Decide Phase (LLM Reasoning)**:
@@ -218,15 +218,15 @@ To prevent automated scripts from taking unguided or dangerous actions, the plat
 
 The table below defines the strict RBAC / network access boundaries for the agent containers:
 
-| Agent Name | Prometheus | Splunk REST | Neo4j Graph | Postgres Vector | Kafka Produce | ServiceNow API |
-| :--- | :---: | :---: | :---: | :---: | :--- | :---: |
-| **TriageAgent** | ❌ | ❌ | ❌ | ❌ | ❌ |  (Webhook) |
-| **RCAAgent** |  |  |  |  | `sre.commands`¹ | ❌ |
-| **PlannerAgent** | ❌ | ❌ | ❌ | ❌ | `sre.commands` | ❌ |
-| **CapacityAgent**|  | ❌ |  | ❌ | `sre.commands` | ❌ |
-| **ErrataAgent** | ❌ | ❌ | ❌ |  | `sre.commands` | ❌ |
-| **LearnerAgent** | ❌ | ❌ | ❌ |  | `sre.commands` | ❌ |
-| **HumanLoop** | ❌ | ❌ | ❌ | ❌ | `sre.commands`² |  |
+| Agent Name | Prometheus | Splunk REST | Neo4j Graph | Postgres Vector | Kafka Produce | ServiceNow API | MCP Tools |
+| :--- | :---: | :---: | :---: | :---: | :--- | :---: | :--- |
+| **TriageAgent** | ❌ | ❌ | ❌ | ❌ | ❌ |  (Webhook) | ❌ |
+| **RCAAgent** |  |  |  |  | `sre.commands`¹ | ❌ | `redhat_support.create_case`, `servicenow_tool.get_ticket_status`, `maintenance_tool.check_active_window`, `suppression_tool.check_suppression` |
+| **PlannerAgent** | ❌ | ❌ | ❌ | ❌ | `sre.commands` | ❌ | `migration_app.trigger_retry`, `migration_app.trigger_rollback` |
+| **CapacityAgent**|  | ❌ |  | ❌ | `sre.commands` | ❌ | `migration_app.trigger_retry` |
+| **ErrataAgent** | ❌ | ❌ | ❌ |  | `sre.commands` | ❌ | ❌ |
+| **LearnerAgent** | ❌ | ❌ | ❌ |  | `sre.commands` | ❌ | ❌ |
+| **HumanLoop** | ❌ | ❌ | ❌ | ❌ | `sre.commands`² |  | ❌ |
 
 ¹ RCAAgent is authorized to produce to `sre.commands` specifically to trigger high-priority diagnostic collection escalation commands (never writes to execution/remediation topics).
 ² HumanLoopAgent is strictly authorized to produce to `sre.commands` only to trigger the `SafeAbort` cleanup command in timeout events. It is strictly blocked from producing to the spoke-exclusive `sre.command-results` topic.

@@ -22,6 +22,12 @@ To handle thousands of alerts without overwhelming Kubernetes control planes or 
 - **Decide**: Hub Agents analyze the incident and propose `SRECommand` payloads into `sre.commands`.
 - **Act**: The Spoke Operator picks up the command, verifies safety rails, and executes it, emitting results back to `sre.command-results`.
 
+### 1.3 Virtualization Migration & Boundary Protocol (NEW)
+To automate VMware VM migrations to OpenShift Virtualization cleanly, the platform integrates with the Forklift (MTV) operator:
+- **Forklift CRD Integration**: Watches native Forklift custom resources (`Plan`, `Migration`) and monitors prehook/posthook job execution phases.
+- **Migration Wave Tracking**: Computes dynamic throughput via `SREMigrationWave` CRDs to flag waves as `AtRisk` if they are projected to overrun scheduled CR timeframes.
+- **Boundary Separation**: Respects the VMware Boundary Exclusion Protocol. The SRE operator has zero direct credentials to vCenter; execution of retries/rollbacks is delegated via MCP tool calls directly to the Migration App's Ansible playbooks.
+
 ## 2. Core Components (The Spoke Operator)
 
 The Spoke operator is deployed to every managed cluster and executes the following critical reconcilers:

@@ -99,6 +99,11 @@ status:
       cnv: "4.16.2"
     installedOperators: ["cnv", "portworx-operator", "vault-secrets-operator", "openshift-gitops"]
     gitopsEnabled: true
+    migration:
+      vcenterConnected: true
+      vddkVersion: "8.0.0"
+      vibInstalled: true
+      csiOffloadReady: true
     lastCapabilityRefresh: "2026-07-18T10:00:00Z"
 ```
 
@@ -157,6 +162,8 @@ SREGlobalConfig ─────── Kafka/Vault/Splunk bootstrap config
     SRECommand ────────── Discrete action execution + Validation phase (§7)
 
     SRERelease ─────────── ArgoCD sync tracking + post-release well-being window
+
+    SREMigrationWave ───── Tracks migration wave timelines, VM progress, and window risk
 ```
 
 ### 4.1 SREGlobalConfig
@@ -204,6 +211,9 @@ Executes one discrete action. Full state machine with the new **Validation** pha
 
 ### 4.7 SRERelease
 Watches ArgoCD `Application` sync completion. Cross-references `SREErrataCache` for newly-introduced vulnerable versions. Runs a 30-minute post-release well-being window — **now correctly queries incident *existence*, not incident *notification state*** (fix #4).
+
+### 4.9 SREMigrationWave (NEW)
+Tracks migration wave timelines, VM progress, and estimates window risk dynamically. Recomputes `projectedCompletionAt` on every VM-completion signal from the Forklift `Migration.status` watch and flips `windowRisk` to `AtRisk` if the projection exceeds the scheduled maintenance/CR window.
 
 ---
 
@@ -312,13 +322,26 @@ SRECommandReconciler checks status.approvedByVerified != "", not spec.approvedBy
 
 `sre.command-results` remains exclusively operator-produced, representing execution outcomes only. Human decisions never appear on that topic.
 
+### 6.4 Rollback Decision Tree (Migration Stream)
+
+RCAAgent extends its confidence-gated hypothesis model for migration failures:
+
+- **Case A: High Confidence + Known Transient Pattern** (matches a historical incident with rating >= 4)
+  -> Triggers `RetryMigration` by calling the MCP tool `migration_app.trigger_retry(vm_id)` on the Migration App MCP server to re-run the Ansible migration playbook.
+- **Case B: High Confidence + Structural / Unsupported Configuration** (RDM disks, incompatible hardware version)
+  -> Triggers `RecommendRollbackToVMware` by calling the MCP tool `migration_app.trigger_rollback(vm_id)` to power on the VM in VMware and restore DNS via Ansible (respecting the boundary exclusion protocol).
+- **Case C: Low Confidence / Genuinely Ambiguous**
+  -> Sets `insufficient_data = true`, halts automation, and triggers `redhat_support.create_case(...)` to automatically open a Red Hat case, attaching the collected diagnostics/evidence bundle (virt-v2v, precheck, and hook logs).
+- **Case D: Time-Boxed Window Exceeded / At Risk**
+  -> Evaluates `projectedCompletionAt` against `windowEnd`. If the VM is stuck and MTV cannot complete within the remaining CR window, forces a rollback recommendation via the MCP `trigger_rollback(vm_id)` tool.
+
 ---
 
 ## 7. GitOps Exclusion Protocol (unchanged from v1 — this part was already correct)
 
 ```
 Is the action in the runtime-operations allowlist?
-  (CordonNode, DrainNode, LiveMigrateVM, ExpandPVC*, transient pod deletion)
+  (CordonNode, DrainNode, LiveMigrateVM, ExpandPVC*, HardRefreshArgoCDApp, transient pod deletion)
     YES → execute directly. GitOps never manages these.
     NO  → is the target resource GitOps-tracked (ArgoCD label / in an Application's
           managed resource list)?
@@ -331,7 +354,7 @@ Is the action in the runtime-operations allowlist?
 * ExpandPVC only if storage class supports online expansion without a manifest change.
 ```
 
-The operator **never** creates a Git commit, branch, or PR. This is a hard boundary, not a policy toggle.
+The operator and agents **never** create a Git commit, branch, or PR (including automated rollback PRs). This is a hard boundary, not a policy toggle. All GitOps reverts, commits, and rollback integrations are handled manually by SREs.
 
 ---
 
@@ -348,6 +371,16 @@ The operator **never** creates a Git commit, branch, or PR. This is a hard bound
 | `sre.crosscluster.reads` | `{cluster}:{kind}:{name}` | Hub `SRECrossClusterReadReconciler` | RAG ingestion pipeline, `TopologyAgent`, Splunk Connect | 1h |
 | `sre.audit` | `{cluster-id}` | Spoke reconcilers (all mutations, approvals, bypasses) | `PolicyLearnerAgent`, Splunk Connect (90d compliance) | 90d |
 | `sre.dead-letter` | `{topic}:{key}` | Any producer on retry exhaustion | Manual review, DLQ alert | 7d |
+| `migration.prechecks.results` | `{plan_id}:{vm_id}` | FastAPI / Airflow | React UI, EDA | 30d |
+| `migration.prechecks.failed` | `{plan_id}:{check_type}` | FastAPI | EDA → ServiceNow, SRE notification | 30d |
+| `migration.plans.created` | `{plan_id}` | FastAPI | EDA, GBGF notification service | 90d |
+| `migration.jobs.trigger` | `{plan_id}:{vm_id}` | FastAPI scheduler | EDA → Ansible → MTV | 7d |
+| `migration.hooks.status` | `{plan_id}:{vm_id}:{hook_type}` | Migration watcher | FastAPI → Postgres | 30d |
+| `migration.progress` | `{plan_id}:{vm_id}` | Migration watcher | FastAPI → WebSocket → React UI | 7d |
+| `migration.failures` | `{plan_id}:{vm_id}` | Migration watcher | FastAPI → Postgres, SRE alert | 90d |
+| `migration.rollback.requested` | `{plan_id}:{vm_id}` | FastAPI (SRE action) | EDA → Ansible rollback playbook | 90d |
+| `migration.vcenter.add` | `{vcenter_id}` | FastAPI | EDA → Ansible → Airflow DAG | 30d |
+| `cluster.builds.requested` | `{cluster_id}` | FastAPI | EDA → Ansible → ACM | 90d |
 
 ### 8.1 Multi-Region Kafka Federation
 
@@ -405,7 +438,7 @@ This keeps your differentiator (correlation + RCA intelligence) as the thing you
 Routes incidents. Checks Level 1 template match (§1.2) before dispatching to `RCAAgent`. Creates baseline ServiceNow ticket for P1.
 
 ### 10.2 RCAAgent (Level 2, OODA loop — unchanged core logic)
-Observe (Splunk query window `[triggerTime - 15m, now()]` + diagnostics bundle + topology) → Orient (RAG retrieval, pgvector) → Decide (schema-enforced LLM call, **now filtered by capability model**) → Act (emit `SRECommand`, or halt on `insufficient_data`).
+Observe (Splunk query window `[triggerTime - 15m, now()]` + diagnostics bundle + topology + migration precheck status) → Orient (RAG retrieval, pgvector with seeded MTV/virt-v2v runbooks) → Decide (schema-enforced LLM call, now filtered by capability model and Rollback Decision Tree) → Act (emit `SRECommand`, or halt on `insufficient_data`).
 
 ### 10.3 RemediationPlannerAgent
 Translates RCA conclusion into ordered `SRECommand` steps. **Now filters candidate actions against `SREClusterRegistration.status.capabilities` before proposing them.**
@@ -437,6 +470,9 @@ def detect_fleet_pattern(self):
                 title=f"Fleet pattern: {signature} across {len(affected)} clusters",
                 severity="P1Critical" if len(affected) > 10 else "P2High"
             )
+    # Wave-level systemic failure folding: fold repeating precheck or execution signals
+    # within the same wave into a single MigrationWaveSystemicFailure incident and trigger PauseMigrationWave
+    fold_wave_systemic_failures()
 ```
 Directly reduces LLM cost (fewer duplicate `RCAAgent` runs) and gives humans immediate "this is a platform bug, not my cluster" signal.
 
@@ -566,6 +602,11 @@ New query-level tools are introduced to the registry:
 * `servicenow_tool.get_ticket_status(ticket_id)` -> Queries active status and assignment groups.
 * `maintenance_tool.check_active_window(cluster_id, resource_ref)` -> Checks if the resource is currently in a scheduled maintenance window.
 * `suppression_tool.check_suppression(fingerprint)` -> Checks for active local or fleet-wide suppressions.
+* `migration_app.trigger_retry(vm_id)` -> Triggers the external migration app's Ansible playbook to retry migration.
+* `migration_app.trigger_rollback(vm_id)` -> Triggers the external migration app's Ansible playbook to rollback the VM to VMware.
+* `redhat_support.create_case(title, evidence_ref)` -> Creates a Red Hat Support ticket and attaches the gathered evidence.
+* `argocd_client.hard_refresh(app_name)` -> Requests a hard refresh and sync of the specified ArgoCD application.
+* `git_repo.analyze_commits(repo_url, target_branch, tag)` -> Scrapes release tags and analyzes commit histories matching redhat-cop standards to extract upgrades, config shifts, new components, and VLAN mappings.
 
 ---
 
@@ -596,7 +637,7 @@ sre_fleet_duplicate_suppression_rate                     # FleetCorrelationAgent
 
 | Dimension | Field | Values |
 |---|---|---|
-| Signal type | `signals[].type` | `Alert`, `Event`, `MetricThreshold`, `LogPattern`, `ClusterOperator`, `NodeCondition`, `NTPCheck`, `DNSCheck`, `NexusPullCheck`, `RBACEvent`, `HardwareEvent`, `VaultCondition`, `PortworxCondition`, `DellCSMCondition`, `ArgoCDSyncEvent`, `ReleaseEvent`, `ErrataMatchSignal`, `PacketDropSignal`, `CapabilityGate` |
+| Signal type | `signals[].type` | `Alert`, `Event`, `MetricThreshold`, `LogPattern`, `ClusterOperator`, `NodeCondition`, `NTPCheck`, `DNSCheck`, `NexusPullCheck`, `RBACEvent`, `HardwareEvent`, `VaultCondition`, `PortworxCondition`, `DellCSMCondition`, `ArgoCDSyncEvent`, `ReleaseEvent`, `ErrataMatchSignal`, `PacketDropSignal`, `CapabilityGate`, `ForkliftPlanCondition`, `ForkliftMigrationVMStatus`, `ForkliftHookJobStatus`, `MigrationPrecheckSignal`, `WindowsGuestHealthSignal` |
 | Requirement | `signals[].required` | `true` / `false` |
 | Comparison | `signals[].valueExpr` | `>`, `<`, `>=`, `<=`, `==`, `!=`, regex |
 | Match count | `minSignalCount` | int |
@@ -621,6 +662,11 @@ New this pass: MachineConfigInspection  — reads rendered chrony.conf etc., not
                SimulatorQuery           — calls NetworkPolicySimulator tool for policy denial
                PodStatusInspection      — classifies CrashLoop as Platform/App/Ambiguous from
                                            exitCode + terminated.reason
+               ForkliftPlanCondition    — watches Plan.status conditions
+               ForkliftMigrationVMStatus— watches per-VM pipeline phase inside Migration.status
+               ForkliftHookJobStatus    — watches prehook/posthook Job/Pod status
+               MigrationPrecheckSignal  — consumes precheck-complete/failed events from migration app
+               WindowsGuestHealthSignal — queries Windows BugCheck events in Splunk or guest Agent status
 ```
 
 ---
@@ -641,13 +687,18 @@ Do not go to production without backup/restore runbooks for:
 ```
 1. Fix suppression/well-being interaction (§6.1)              — correctness bug, ship first
 2. Fix approval-flow topic inconsistency (§6.3)                 — doc + small code fix
-3. Capability Model (§2)                                        — unlocks correct action gating
-4. Tiered decision architecture, Level 0 first (§1.1)            — biggest cost/latency win
-5. FleetCorrelationAgent (§10.8)                                 — pays for itself in LLM savings
-6. Validation phase on SRECommand (§6.2)                         — closes "succeeded but not healthy" gap
-7. Agent-platform observability (§13.2)                          — you can't tune what you can't measure
-8. Level 1 template-match path (§1.2)                            — depends on historical_incidents volume
-9. Argo Workflows delegation for complex plans (§9)               — do when first DAG-shaped need appears
-10. Workflow catalog / intent layer                              — lower urgency, do after capability model
-11. DR runbooks for stateful systems (§15)                        — required gate before GA, not before dev
+3. Wire operator to watch Forklift's native CRDs                 — Plan/Migration/per-VM status
+4. SREMigrationWave + window-risk tracking                      — dynamic CR window tracking
+5. Consume precheck-complete events via Kafka                    — ToolRegistry abstraction integration
+6. Implement the VMware Boundary Exclusion Protocol explicitly   — secure rollback pathway
+7. Capability Model updates (§2)                                — include migration capability keys
+8. Tiered decision architecture, Level 0 first (§1.1)            — biggest cost/latency win
+9. FleetCorrelationAgent wave-level failure folding (§10.8)     — prevent wave alert storms
+10. Seed runbook corpus with MTV/virt-v2v signatures             — quick RAG bootstrap
+11. Hypercare well-being window, reusing SRERelease pattern      — post-migration monitoring
+12. WindowsGuestHealthSignal & network packet drops telemetry    — guest stability validation
+13. Level 1 template-match path (§1.2)                            — depends on historical_incidents volume
+14. Argo Workflows delegation for complex plans (§9)               — do when first DAG-shaped need appears
+15. Workflow catalog / intent layer                              — lower urgency, do after capability model
+16. DR runbooks for stateful systems (§15)                        — required gate before GA, not before dev
 ```

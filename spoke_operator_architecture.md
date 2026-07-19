@@ -42,7 +42,7 @@ The operator split-deployment architecture ensures high availability for validat
 
 ## 3. CRD Definition & Reconciler Details
 
-The Spoke Operator registers and manages 6 namespaced Custom Resources:
+The Spoke Operator registers and manages 7 Custom Resources:
 
 ```
             SREGlobalConfig ─────── (Configures credentials / Kafka)
@@ -61,6 +61,8 @@ The Spoke Operator registers and manages 6 namespaced Custom Resources:
                   │
                   ▼
               SRECommand ────────── (Executes discrete actions on the API)
+
+           SREMigrationWave ─────── (Tracks migration wave timelines and window risks)
 ```
 
 ### 3.1 `SREGlobalConfig`
@@ -70,13 +72,13 @@ The Spoke Operator registers and manages 6 namespaced Custom Resources:
 
 ### 3.2 `SREPolicy`
 * **Scope**: Namespaced.
-* **Purpose**: Coordinates all active checks and defines the **Signal Sources** (e.g., Prometheus metrics, Kubernetes events, Pod log regex patterns, OpenShift ClusterOperators, NTP drifts, CoreDNS error rates, Nexus pull failures) that stream into the BoltDB signal buffer.
+* **Purpose**: Coordinates all active checks and defines the **Signal Sources** (e.g., Prometheus metrics, Kubernetes events, Pod log regex patterns, OpenShift ClusterOperators, NTP drifts, CoreDNS error rates, Nexus pull failures, ForkliftPlanCondition, ForkliftMigrationVMStatus, ForkliftHookJobStatus, MigrationPrecheckSignal, WindowsGuestHealthSignal) that stream into the BoltDB signal buffer.
 * **Reconciler Flow**: 
   - Tracks configured `SignalSources` in parallel.
-  - Tail logs, filters cluster events, and queries metric endpoints.
-  - Converts matched conditions (e.g., matching a "failed to retrieve secret" environment plugin pattern) into structured `Signal` objects.
+  - Tails logs, filters cluster events, queries metric endpoints, and watches Forklift (MTV) CRDs and migration event streams.
+  - Converts matched conditions (e.g., matching a forklift image conversion failure or VM guest BSOD signature) into structured `Signal` objects.
   - Writes signals to the BoltDB buffer and publishes them to `sre.telemetry.raw`.
-  - **Capability Matrix**: On every heartbeat cycle, the operator publishes a `status.capabilities` object (detailing local CNI, Storage Providers, Hypervisor versions) to `sre.telemetry.raw`, ensuring the Hub LLMs have accurate, up-to-date execution boundaries.
+  - **Capability Matrix**: On every heartbeat cycle, the operator publishes a `status.capabilities` object (detailing local CNI, Storage Providers, Hypervisor versions, and migration state details like vCenter connection and VDDK checks) to `sre.telemetry.raw`, ensuring the Hub LLMs have accurate, up-to-date execution boundaries.
 
 ### 3.3 `SRECorrelationRule`
 * **Scope**: Namespaced.
@@ -112,13 +114,24 @@ The Spoke Operator registers and manages 6 namespaced Custom Resources:
 
 ### 3.7 `SRERelease`
 * **Scope**: Namespaced.
-* **Purpose**: Tracks ArgoCD Sync deployment events (manual GitOps integrations) and runs post-deployment health check loops.
+* **Purpose**: Tracks ArgoCD Sync deployment events (mapping to redhat-cop standards configurations) and runs post-deployment health check loops.
 * **Reconciler Flow**:
-  - Watches ArgoCD `Application` resources for sync completion.
-  - On sync completion, creates a `SRERelease` CR, capturing the Helm charts, Git tag, commit SHA, and target namespaces.
+  - Watches ArgoCD `Application` resources for sync status changes (drift detection, sync progress, and completion).
+  - If the application state transitions to `Degraded` or `OutOfSync`, the reconciler harvests the drift configuration, namespace events, and operator logs, raising an `SREIncident` with the root cause evidence.
+  - Supports executing `HardRefreshArgoCDApp` commands via `SRECommand` to clear transient stuck syncs or validation hooks.
+  - On sync completion, creates/updates the `SRERelease` CR, capturing the Git tag, commit SHA, Helm versions, and affected namespaces.
   - Automatically queries the `SREErrataCache` to check if any newly introduced package versions contain active critical/warning CVEs.
   - Begins a 30-minute post-release well-being check. The reconciler queries for the *existence* of any `SREIncident` (including `Suppressed` ones) in the affected namespaces during this window. If found, it tags the incident with the release context and updates `status.phase = Degraded`.
   - Publishes a `ReleaseEvent` signal to `sre.signals.buffer`.
+
+### 3.8 `SREMigrationWave`
+* **Scope**: Namespaced.
+* **Purpose**: Tracks VMware-to-OpenShift migration waves, execution statuses, and maintenance window risks.
+* **Reconciler Flow**:
+  - Listens to native forklift operator resources (`Plan` and `Migration` CRDs) on the spoke cluster.
+  - Monitors per-VM migration status, hook job runs, and throughput metrics.
+  - Dynamically extrapolates `projectedCompletionAt`.
+  - If the projected completion time pushes past the scheduled `windowEnd`, sets `status.windowRisk = AtRisk` to trigger proactive alerts.
 
 ---
 
