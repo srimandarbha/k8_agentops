@@ -1,0 +1,286 @@
+# Agentic AI for Disconnected Bare-Metal OpenShift Virtualization
+### Architecture, Use Cases, Capability Matrix & Implementation Plan
+
+**Environment:** Disconnected/air-gapped, bare-metal OpenShift with OpenShift Virtualization. Storage via Pure Storage or Dell CSM (no ODF/Ceph). AI reasoning via a centralized LLM gateway (no local SLM).
+
+---
+
+## Table of Contents
+
+1. [Executive Summary](#1-executive-summary)
+2. [Classification Framework](#2-classification-framework)
+3. [Part A — Storage: Must-Have Agentic AI Use Cases](#3-part-a--storage-must-have-agentic-ai-use-cases)
+4. [Part B — Storage Day-2 Operations (Full Inventory)](#4-part-b--storage-day-2-operations-full-inventory)
+5. [Part C — Compute, Network, Rightsizing & Other Domains](#5-part-c--compute-network-rightsizing--other-domains)
+6. [Part D — Agent Capability & Integration Matrix](#6-part-d--agent-capability--integration-matrix)
+7. [Part E — LLM Call Decision Framework](#7-part-e--llm-call-decision-framework)
+8. [Part F — OpenShift Virtualization Component Readiness](#8-part-f--openshift-virtualization-component-readiness)
+9. [Part G — Orchestrator Architecture](#9-part-g--orchestrator-architecture)
+10. [Part H — Implementation Roadmap](#10-part-h--implementation-roadmap)
+11. [Appendix — Master Use-Case Reference Table](#11-appendix--master-use-case-reference-table)
+
+---
+
+## 1. Executive Summary
+
+There is no shrink-wrapped "agentic AI for storage/compute/network" product that covers this stack end to end. This is a build effort layered on top of existing CSI/CSM tooling, OpenShift platform operators, and a centralized LLM gateway. Two constraints shape everything in this document:
+
+- **No ODF/Ceph** means there's no internal self-healing/rebalancing intelligence to lean on — more operational judgment shifts onto agents watching the Pure/Dell layer directly.
+- **Disconnected + LLM gateway** means vendor SaaS "AI" tools (Pure1, Dell CloudIQ/AIOps, Red Hat Insights-hosted features) are largely unusable as-is — they assume phone-home connectivity. Anything you want that capability from needs to be self-hosted against your own gateway and your own Prometheus/Thanos, not the vendor's cloud.
+
+The guiding principle used throughout: **automate anything deterministic, especially failover/fencing/security-enforcement hot paths. Reserve the LLM for forecasting, cross-system correlation, and reasoning over unstructured material (matrices, KBs, logs).**
+
+---
+
+## 2. Classification Framework
+
+Every Day-2 scenario in this document is tagged with one of three labels:
+
+| Tag | Meaning | Typical implementation |
+|---|---|---|
+| **[Automate]** | Rule-based, deterministic, no reasoning needed | Operator, Ansible, GitOps, cert-manager, OPA/Kyverno |
+| **[Agent]** | Needs synthesis across ambiguous or cross-system signals, or reading unstructured docs | LLM-backed agent with tool access |
+| **[Agent→Automate]** | Agent diagnoses/recommends; deterministic layer executes once approved | LLM agent + guardrail engine + human approval gate |
+
+Default posture: anything in a failover, fencing, or security-enforcement hot path stays **[Automate]** — you want determinism and speed there, not a reasoning pass.
+
+---
+
+## 3. Part A — Storage: Must-Have Agentic AI Use Cases
+
+In priority order:
+
+1. **Live-migration / RWX readiness gate.** Plain `pure-csi` against FlashArray is block/RWO only — RWX raw block for live migration needs Portworx Direct Access on top of FlashArray/FlashBlade. Dell's RWX story differs by backend (PowerScale/PowerStore file vs. PowerFlex block). An agent should check actual access mode before any migration or node drain instead of a human assuming it's fine — this is the single most common "why did my VM migration hang" surprise.
+
+2. **Upgrade/interoperability pre-flight.** No live internet means no quick check of Red Hat's OCP support matrix, Dell's E-Lab Navigator, or Pure's compatibility guide. An agent that cross-references your *mirrored* copies of these matrices against target OCP + CSI driver + CSM Operator + array firmware versions before a change window is the highest blast-radius item on this list.
+
+3. **Snapshot/backup/DR compliance + orphan reclaim.** With no Ceph/ODF fallback, every VM's protection posture rides entirely on Dell CSM Snapshot/Replication or Pure's snapshot policies/ActiveDR being correctly applied. An agent continuously diffs "VMs that exist" against "VMs with a current valid policy," and separately reclaims orphaned PVs/VolumeSnapshotContents quietly eating array capacity.
+
+4. **Capacity forecasting.** Disconnected sites can't burst to cloud storage, and another shelf/array is a weeks-to-months procurement cycle. Trend thin-provisioning overcommit and PVC growth per namespace to flag "you hit the wall in N weeks" well before the array does.
+
+5. **CSI/CSM health, drift, and cert/token rotation.** Watches CSM Operator CRs, controller/node plugin health, StorageClass parameter drift against baseline. Disconnected clusters usually can't use a public ACME CA, so CSM Authorization certs and Pure API tokens are tracked manually — flag expiry before it's a P1.
+
+6. **Multipath/SAN incident correlation.** Bare-metal FC/iSCSI means path flapping is a real failure class. Correlate node multipath logs with CSI node-plugin and array-side port/host-group state into a plain-language RCA draft — this compensates for small on-site teams not having easy vendor remote support.
+
+7. **Replication/DR failover-readiness.** For Dell CSM Replication or Pure ActiveDR/ActiveCluster: verify actual RPO/lag and runbook currency rather than assuming replication "is just running" — there's no cloud DR safety net behind a disconnected site.
+
+8. **Golden image/DataVolume lifecycle.** CDI-based golden images need patch cadence and clone fan-out that respects per-volume snapshot limits on the array, avoiding a snapshot-slot wall mid-provisioning-wave.
+
+### Architecture notes specific to the LLM-gateway / disconnected pattern
+
+- The gateway endpoint has to live **inside the enclave** — an internally hosted/mirrored endpoint, not a call out to a public API. Red Hat's own OpenShift Lightspeed is built around the same shape: it points at an external-to-OpenShift LLM provider rather than shipping a bundled model, so this architecture choice matches where Red Hat itself is headed.
+- Wrap Pure and Dell as **MCP tool servers**, not ad hoc scripts. There's already a public reference pattern for this against Pure's FlashBlade REST API (read-only first, then extended to take actions) — the same shape applies to Dell CSM/CSI objects and the PowerFlex/PowerStore/PowerMax APIs, though that side needs to be built in-house.
+- **Read-only by default; human approval gate for anything destructive.** A wrong call against a production array is an incident, not a bad chat reply.
+- **Mirror your knowledge base**, not just your registry. Compatibility matrices, KBs, and runbooks need to be in the RAG store and refreshed through the same process used for image mirroring.
+- If already RHEL/Ansible-heavy, look at Red Hat's AgentOps framework and its agentic skill packs (RHEL/OpenShift/Ansible) before building fully bespoke — it doesn't ship Pure/Dell-specific skills, but it's the governance pattern Red Hat is standardizing on for this stack.
+
+---
+
+## 4. Part B — Storage Day-2 Operations (Full Inventory)
+
+**Provisioning & lifecycle**
+- Dynamic PV/PVC provisioning — [Automate]
+- PVC online expansion at threshold — [Automate]
+- StorageClass/tier-to-SLA reconciliation — [Agent→Automate]
+- Golden image/DataVolume patch cadence + clone fan-out vs. snapshot limits — [Agent→Automate]
+- Orphaned PV/PVC/VolumeSnapshotContent reclaim — [Agent→Automate]
+- Namespace/tenant quota enforcement — [Automate]
+- VM decommission chain (delete → snapshot/backup cleanup → array reclaim) — [Agent→Automate]
+
+**Capacity management**
+- Threshold alerting per pool/array/namespace — [Automate]
+- "Days until full" forecasting — [Agent]
+- Thin-provisioning overcommit interpretation — [Agent]
+- Expansion action itself (LUN/pool growth) — [Agent→Automate]
+- Chargeback/showback — [Automate] aggregation, [Agent] narrative layer
+
+**Performance management**
+- Latency/IOPS/throughput baseline alerting — [Automate]
+- "Why is this VM slow" root cause — [Agent]
+- Noisy-neighbor detection + QoS remediation — [Agent→Automate]
+- Multipath load-balance/path-count verification — [Automate]
+
+**Data protection & DR**
+- Snapshot schedule execution — [Automate]
+- Coverage compliance audit — [Agent] find gaps, [Automate] remediate
+- Backup job retry on transient failure — [Automate]; escalate after N failures — [Agent]
+- Replication RPO/lag threshold monitoring — [Automate]; "is this actually a problem" — [Agent]
+- DR failover orchestration — [Agent→Automate], always human-gated
+- DR drill execution + report — [Agent→Automate]
+- Immutable/SafeMode policy compliance — [Automate]
+- Periodic automated restore testing — [Agent→Automate]
+
+**Resiliency & failure handling**
+- CSI controller/node plugin health + restart — [Automate]
+- Node/path failure → VM reschedule (CSM Resiliency / Portworx-style) — **[Automate], deliberately** — keep the LLM fully out of this loop; failover needs deterministic speed
+- Array controller failover handling — [Automate]
+- Post-failover validation + plain-language incident summary — [Agent]
+
+**Security, identity & compliance**
+- RBAC/Authorization enforcement — [Automate]
+- Credential/token/cert rotation execution — [Automate]; expiry-flagging + renewal drafting — [Agent]
+- Encryption-at-rest verification — [Automate]
+- Audit trail of storage admin actions — [Automate] collect, [Agent] spot anomalies
+- CVE exposure against mirrored image inventory — [Agent]
+
+**Upgrade & change management**
+- CSI driver/CSM Operator upgrade execution — [Automate] (OLM), once approved
+- Interoperability/compatibility pre-flight — [Agent]
+- OCP upgrade impact analysis on storage layer — [Agent]
+- Canary/staged rollout validation — [Agent→Automate]
+- Change-freeze/maintenance-window compliance — [Automate]
+
+**Incident response & troubleshooting**
+- Multi-source log/event correlation into RCA draft — [Agent]
+- PVC stuck Pending triage — [Agent] first pass, [Automate] if known signature
+- Live-migration failure triage — [Agent]
+- First-response remediation for known alert signatures — [Automate]
+- Vendor support case pre-packaging (log bundle + summary) — [Agent]
+
+**OpenShift Virtualization-specific**
+- Live-migration/RWX readiness pre-check — [Agent]
+- Guest-consistent snapshot orchestration (freeze/snapshot/thaw) — [Automate]; [Agent] only for "guest agent unresponsive" edge case
+- Storage-aware VM placement/anti-affinity (PowerFlex HCI locality) — [Automate]
+- Hot-add/hot-resize validation — [Automate]
+
+**Fleet/governance (multi-site)**
+- Cross-cluster config/inventory drift — [Agent]
+- SLA/SLO compliance reporting — [Automate] + [Agent] narrative
+- Compliance attestation packaging — [Agent→Automate]
+
+---
+
+## 5. Part C — Compute, Network, Rightsizing & Other Domains
+
+### Compute — Nodes, Control Plane & Bare-Metal Hardware
+- Node provisioning/decommission via Metal3/BareMetalHost — [Automate]
+- Firmware/BIOS/BMC (Redfish) compatibility check before update — [Agent]
+- Predictive hardware failure from Redfish/SEL event patterns — [Agent]
+- NTP/time drift — [Automate] (high priority — silent cause of cert/auth failures)
+- MachineConfig/MCP rollout & drift — [Automate]; "why did this MCP stall" — [Agent]
+- etcd health/defrag/backup — [Automate]; "is this latency spike a problem" — [Agent]
+- Node cordon/drain orchestration — [Agent→Automate]
+- PerformanceProfile / CPU isolation / huge pages tuning — [Agent→Automate]
+- Node fencing/remediation (Node Health Check, Self Node Remediation, Fence Agents Remediation) — **[Automate], deliberately**
+- GPU Operator driver/firmware matching — [Agent→Automate]
+- "Do we need another node" capacity forecast — [Agent]
+
+### Network
+- OVN-Kubernetes connectivity failures — [Agent] triage, [Automate] restart
+- MetalLB pool health/failover — [Automate]
+- Ingress/route cert rotation — [Automate] execution; expiry tracking — [Agent]
+- CoreDNS health — [Automate]
+- NodeNetworkConfigurationPolicy (nmstate) drift — [Automate]; "why didn't this apply" — [Agent]
+- SR-IOV/DPDK VF allocation + NAD validation — [Agent→Automate]
+- Live-migration network readiness (bandwidth/isolation) — [Agent]
+- Mirror registry reachability/TLS health — [Automate] (this is the cluster's "internet" — tier-1)
+- Enclave boundary firewall/proxy rule drift — [Agent]
+- Switch/NIC/bonding flap correlation — [Agent]
+- IP/VLAN exhaustion forecasting — [Agent]
+
+### Rightsizing & Capacity Optimization
+- Container/pod CPU-memory request-limit recommendations — [Agent→Automate]. Kruize/Autotune is real, open-source tooling here: it's the engine behind Red Hat's Resource Optimization Service in Insights, analyzing historical Prometheus/Thanos usage to recommend CPU, memory, and NVIDIA GPU MIG slice allocations, with separate short/medium/long-term recommendations (24h/7d/15d windows) per container. **Self-host the Kruize Operator against your own Prometheus** rather than the Insights-hosted path — Insights itself assumes connectivity.
+- VM-level (vCPU/memory) right-sizing — [Agent→Automate]. Red Hat shipped this specifically for OpenShift Virtualization as a technology preview via Red Hat Advanced Cluster Management 2.15, with pod/VM-level recommendations in developer preview since March 2025. Still preview-grade, and rides on ACM hub connectivity — validate the disconnected deployment path before relying on it.
+- Idle/zombie VM detection — [Agent]
+- NUMA/CPU-pinning alignment for dedicated-CPU VMs — [Agent→Automate]
+- Namespace ResourceQuota tuning vs. actual burn — [Agent→Automate]
+- Bin-packing/consolidation via descheduler — [Agent→Automate]
+- License-driven sizing (per-core OS/DB licensing limits on vCPU counts) — [Agent]
+- Compute overcommit ratio tuning — [Agent]
+
+### Platform Lifecycle & Upgrades
+- OCP upgrade execution (OLM/CVO) — [Automate], once approved
+- Full-stack upgrade compatibility pre-flight (OCP + OCP Virt + CSI/CSM + CNI + firmware together) — [Agent] — the cluster-wide superset of the storage item; likely the single highest-value agent overall
+- Canary/staged node-pool rollout validation — [Agent→Automate]
+- GitOps (ArgoCD) drift — [Automate] revert; [Agent] root-cause for non-trivial drift
+- Cluster/VM backup (OADP/Velero) job monitoring — [Automate]; coverage-gap audit — [Agent]
+- Change-freeze/maintenance-window compliance — [Automate]
+- DR runbook currency + drill execution — [Agent→Automate]
+
+### Security, Identity & Compliance
+- RBAC/SCC enforcement — [Automate]
+- Compliance Operator scans — [Automate] execution; [Agent] prioritize findings
+- Platform-wide cert rotation — [Automate] execution; expiry tracking — [Agent]
+- CVE matching against mirrored image inventory — [Agent]
+- Audit log anomaly detection — [Agent]
+- Image signing/provenance verification (cosign/sigstore) — [Automate]
+
+### Observability Stack Itself
+- Prometheus/Alertmanager/Thanos health & retention — [Automate]
+- Alert noise reduction/dedup into incident narrative — [Agent]
+- SLO drift from actual usage — [Agent]
+
+### Disconnected Supply Chain (Registry & Mirroring)
+- Mirror sync execution (oc-mirror) on cadence — [Automate]
+- What to include/prune this mirror cycle — [Agent]
+- Post-mirror signature/checksum verification — [Automate]
+- Operator catalog compatibility check before adding to mirror — [Agent]
+
+### OpenShift Virtualization Cross-Cutting
+- VM scheduling/anti-affinity for compute+storage locality — [Automate] once policy defined
+- GPU passthrough/vGPU allocation — [Agent→Automate]
+- Template/instance-type governance — [Automate]
+- End-to-end live-migration readiness (storage RWX + network bandwidth + target node capacity, together) — [Agent] — the highest-leverage single agent across the whole list, since it's the one place compute, network, and storage all have to line up simultaneously
+
+---
+
+## 6. Part D — Agent Capability & Integration Matrix
+
+### Platform layer (build once, shared by every domain agent)
+
+- **LLM gateway access** with function/tool-calling support — not just chat completion
+- **Embedding model + vector store** for RAG, self-hosted (pgvector/Milvus/Weaviate) since cloud embedding APIs won't reach a disconnected enclave
+- **MCP tool servers**, one per integration, so the gateway calls a standard interface instead of bespoke scripts
+- **Orchestration/agent framework** (LangGraph, CrewAI, Semantic Kernel, or custom)
+- **Scoped credentials per tool** via a secrets manager (Vault, or OpenShift Secrets + External Secrets Operator) — never one shared credential across agents
+- **Deterministic guardrail/policy engine** (OPA/Kyverno-style) between "agent proposes" and "action executes"
+- **Human approval channel** reachable inside the enclave (Slack/Teams/ITSM)
+- **Full trace logging** of every prompt, tool call, and action — mandatory for audit
+- **Versioned knowledge corpus** (compat matrices, KBs, runbooks), refreshed through the same mechanism used to mirror images
+
+### Domain-specific integration matrix
+
+| Domain | Reads | Writes/Actions | Notes |
+|---|---|---|---|
+| Storage | Pure REST API, Dell CSM/CSI CRs + PowerFlex/PowerStore/PowerMax/Unity APIs, CSI metrics/logs | Same APIs (expand/snapshot/replicate), PVC/SC objects | Vendor SDK tokens, least-privilege per array |
+| Compute | BareMetalHost CRs, Redfish per BMC, node-exporter | Redfish power/firmware actions, MCO, node API | Redfish auth differs by vendor (iDRAC vs iLO) |
+| Network | OVN-K, NMState, MetalLB CRs, CoreDNS, network metrics | NNCP apply, network objects | SR-IOV device plugin state |
+| Rightsizing | Prometheus/Thanos history, Kruize API | Resource patch (requests/limits), VM spec patch | Kruize is a tool the agent *calls*, not something it reasons from scratch |
+| Platform lifecycle | OLM/CVO status, mirrored upgrade graph, ArgoCD | OLM subscriptions, ArgoCD sync | Mirrored upgrade graph is a hard disconnected dependency |
+| Security/compliance | Compliance Operator results, audit logs, mirrored CVE feed | RBAC/SCC objects, remediation CRs | Mirrored CVE feed is itself a supply-chain dependency |
+| Supply chain | oc-mirror logs, registry catalog | oc-mirror execution, registry GC | Effectively "internet health" for the whole cluster |
+
+---
+
+## 7. Part E — LLM Call Decision Framework
+
+### Pipeline
+
+```
+Trigger
+  → Gather signals                [no LLM]
+  → Classify                      [LLM if novel, rules if known signature]
+  → Plan + tool loop               [LLM, iterative]
+  → Execute tools                 [no LLM]
+  → Interpret results              [LLM]
+  → Synthesize recommendation      [LLM]
+  → Guardrail check                [no LLM, code]
+  → Human approval                 [human]
+  → Execute change                [no LLM]
+  → Verify                        [no LLM, optional LLM summary]
+  → Log / feed back to runbooks   [no LLM]
+```
+
+The LLM appears at exactly four points: **classifying** ambiguous signals, **planning** which tool to call next, **interpreting** messy/unstructured tool output, and **synthesizing** a human-readable recommendation. Everything else stays deterministic code, on purpose.
+
+### Call the LLM when
+- The signal-to-action mapping isn't hardcodable (correlating storage + network + compute logs, for instance)
+- The input is unstructured (vendor docs, compat matrices, freeform logs, KBs)
+- The output needs to be natural language (RCA draft, ticket text, recommendation)
+- It's a first-time/novel situation with no matching runbook signature
+
+### Skip the LLM when
+- The mapping is a known formula (disk >90% → expand by X%)
+- It's latency-critical or safety-critical (fencing, failover) — determinism beats reasoning
+- It's a repeat of a previously-resolved, signature-matched incident — this should already be a runbook, not a fresh LLM call
+- The 
